@@ -1,0 +1,41 @@
+# Core FastAPI and server
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# Async HTTP client
+httpx
+
+# Redis for caching
+redis[hiredis]
+
+# LangChain and LLMs
+langchain
+langchain-community
+langgraph
+langsmith
+
+# Vector database
+chromadb
+
+# Data processing
+pandas
+numpy
+
+# ML libraries
+scikit-learn
+xgboost
+
+# Medical imaging
+tensorflow
+Pillow
+
+# FHIR client
+fhirclient
+
+# Reading level analysis
+textstat
+
+# Environment variables
+python-dotenv

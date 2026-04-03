@@ -1,0 +1,220 @@
+version: '3.8'
+
+services:
+  # Infrastructure Services
+  redis:
+    image: redis:7-alpine
+    container_name: meditwin-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: meditwin-chromadb
+    ports:
+      - "8008:8000"
+    volumes:
+      - chromadb-data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 1: Patient Context Agent
+  patient-context:
+    build:
+      context: ./agents/patient_context
+      dockerfile: Dockerfile
+    container_name: meditwin-patient-context
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - FHIR_BASE_URL=https://hapi.fhir.org/baseR4
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 2: Diagnosis Agent
+  diagnosis:
+    build:
+      context: ./agents/diagnosis
+      dockerfile: Dockerfile
+    container_name: meditwin-diagnosis
+    ports:
+      - "8002:8002"
+    environment:
+      - CHROMADB_HOST=chromadb
+      - CHROMADB_PORT=8000
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      chromadb:
+        condition: service_healthy
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 3: Lab Analysis Agent
+  lab-analysis:
+    build:
+      context: ./agents/lab_analysis
+      dockerfile: Dockerfile
+    container_name: meditwin-lab-analysis
+    ports:
+      - "8003:8003"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 4: Drug Safety MCP
+  drug-safety:
+    build:
+      context: ./agents/drug_safety
+      dockerfile: Dockerfile
+    container_name: meditwin-drug-safety
+    ports:
+      - "8004:8004"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 5: Imaging Triage Agent
+  imaging-triage:
+    build:
+      context: ./agents/imaging_triage
+      dockerfile: Dockerfile
+    container_name: meditwin-imaging-triage
+    ports:
+      - "8005:8005"
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 6: Digital Twin Agent
+  digital-twin:
+    build:
+      context: ./agents/digital_twin
+      dockerfile: Dockerfile
+    container_name: meditwin-digital-twin
+    ports:
+      - "8006:8006"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 8: Explanation Agent
+  explanation:
+    build:
+      context: ./agents/explanation
+      dockerfile: Dockerfile
+    container_name: meditwin-explanation
+    ports:
+      - "8007:8007"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Agent 9: Orchestrator (Main Entry Point)
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: meditwin-orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - PATIENT_CONTEXT_URL=http://patient-context:8001
+      - DIAGNOSIS_URL=http://diagnosis:8002
+      - LAB_ANALYSIS_URL=http://lab-analysis:8003
+      - DRUG_SAFETY_URL=http://drug-safety:8004
+      - IMAGING_TRIAGE_URL=http://imaging-triage:8005
+      - DIGITAL_TWIN_URL=http://digital-twin:8006
+      - EXPLANATION_URL=http://explanation:8007
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      patient-context:
+        condition: service_healthy
+      diagnosis:
+        condition: service_healthy
+      lab-analysis:
+        condition: service_healthy
+      drug-safety:
+        condition: service_healthy
+      imaging-triage:
+        condition: service_healthy
+      digital-twin:
+        condition: service_healthy
+      explanation:
+        condition: service_healthy
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  meditwin-network:
+    driver: bridge
+
+volumes:
+  chromadb-data:
