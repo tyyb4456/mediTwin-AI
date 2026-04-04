@@ -13,7 +13,7 @@ async def test_patient_context_agent():
     # This is a well-known test patient
     patient_id = "example"  # Standard test patient in HAPI FHIR
     
-    agent_url = "http://localhost:8000"
+    agent_url = "http://localhost:8001"
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         print("Testing Patient Context Agent...")

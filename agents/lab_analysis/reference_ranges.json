@@ -1,0 +1,130 @@
+{
+  "26464-8": {
+    "display": "White Blood Cell Count",
+    "unit": "10*3/uL",
+    "adult_male":   { "low": 4.5, "high": 11.0, "critical_low": 2.0, "critical_high": 15.0 },
+    "adult_female": { "low": 4.5, "high": 11.0, "critical_low": 2.0, "critical_high": 15.0 },
+    "pediatric":    { "low": 5.0, "high": 15.0, "critical_low": 2.0, "critical_high": 30.0 },
+    "clinical_notes": "Leukocytosis suggests infection, inflammation, or stress. Leukopenia suggests viral infection or bone marrow suppression."
+},
+  "718-7": {
+    "display": "Hemoglobin",
+    "unit": "g/dL",
+    "adult_male":   { "low": 13.5, "high": 17.5, "critical_low": 7.0,  "critical_high": 20.0 },
+    "adult_female": { "low": 12.0, "high": 15.5, "critical_low": 7.0,  "critical_high": 20.0 },
+    "pediatric":    { "low": 11.0, "high": 16.0, "critical_low": 7.0,  "critical_high": 20.0 },
+    "clinical_notes": "Low hemoglobin indicates anemia. Severity: mild 10-12 g/dL, moderate 8-10, severe <8."
+  },
+  "777-3": {
+    "display": "Platelet Count",
+    "unit": "10*3/uL",
+    "adult_male":   { "low": 150.0, "high": 400.0, "critical_low": 50.0,  "critical_high": 1000.0 },
+    "adult_female": { "low": 150.0, "high": 400.0, "critical_low": 50.0,  "critical_high": 1000.0 },
+    "pediatric":    { "low": 150.0, "high": 400.0, "critical_low": 50.0,  "critical_high": 1000.0 },
+    "clinical_notes": "Thrombocytopenia <150 suggests ITP, DIC, liver disease. Critical <50 indicates serious bleeding risk."
+  },
+  "2160-0": {
+    "display": "Creatinine",
+    "unit": "mg/dL",
+    "adult_male":   { "low": 0.7, "high": 1.3, "critical_low": 0.3, "critical_high": 4.0 },
+    "adult_female": { "low": 0.5, "high": 1.1, "critical_low": 0.3, "critical_high": 4.0 },
+    "pediatric":    { "low": 0.3, "high": 0.7, "critical_low": 0.2, "critical_high": 2.0 },
+    "clinical_notes": "Elevated creatinine indicates renal impairment. Doubling from baseline = AKI Stage 1."
+  },
+  "1742-6": {
+    "display": "Alanine Aminotransferase (ALT)",
+    "unit": "U/L",
+    "adult_male":   { "low": 0.0, "high": 56.0, "critical_low": null, "critical_high": 500.0 },
+    "adult_female": { "low": 0.0, "high": 45.0, "critical_low": null, "critical_high": 500.0 },
+    "pediatric":    { "low": 0.0, "high": 45.0, "critical_low": null, "critical_high": 500.0 },
+    "clinical_notes": "ALT elevation indicates hepatocellular injury. >10x ULN suggests acute hepatitis or ischemic hepatitis."
+  },
+  "2345-7": {
+    "display": "Glucose",
+    "unit": "mg/dL",
+    "adult_male":   { "low": 70.0, "high": 140.0, "critical_low": 50.0, "critical_high": 500.0 },
+    "adult_female": { "low": 70.0, "high": 140.0, "critical_low": 50.0, "critical_high": 500.0 },
+    "pediatric":    { "low": 60.0, "high": 100.0, "critical_low": 40.0, "critical_high": 400.0 },
+    "clinical_notes": "Fasting >126 mg/dL indicates diabetes. Critical hypoglycemia <50 requires immediate treatment."
+  },
+  "1751-7": {
+    "display": "Albumin",
+    "unit": "g/dL",
+    "adult_male":   { "low": 3.5, "high": 5.0, "critical_low": 2.0, "critical_high": null },
+    "adult_female": { "low": 3.5, "high": 5.0, "critical_low": 2.0, "critical_high": null },
+    "pediatric":    { "low": 3.5, "high": 5.0, "critical_low": 2.0, "critical_high": null },
+    "clinical_notes": "Low albumin indicates malnutrition, liver disease, or protein-losing conditions. Affects drug binding."
+  },
+  "2823-3": {
+    "display": "Potassium",
+    "unit": "mEq/L",
+    "adult_male":   { "low": 3.5, "high": 5.0, "critical_low": 2.5, "critical_high": 6.5 },
+    "adult_female": { "low": 3.5, "high": 5.0, "critical_low": 2.5, "critical_high": 6.5 },
+    "pediatric":    { "low": 3.5, "high": 5.0, "critical_low": 2.5, "critical_high": 6.5 },
+    "clinical_notes": "Critical hyperkalemia >6.5 causes life-threatening cardiac arrhythmias. Critical hypokalemia <2.5 causes muscle weakness."
+  },
+  "6598-7": {
+    "display": "Troponin T",
+    "unit": "ng/mL",
+    "adult_male":   { "low": 0.0, "high": 0.01, "critical_low": null, "critical_high": 0.1 },
+    "adult_female": { "low": 0.0, "high": 0.01, "critical_low": null, "critical_high": 0.1 },
+    "pediatric":    { "low": 0.0, "high": 0.01, "critical_low": null, "critical_high": 0.1 },
+    "clinical_notes": "Any elevation indicates myocardial injury. Rise-and-fall pattern = ACS. Demand ischemia in sepsis/pneumonia."
+  },
+  "1988-5": {
+    "display": "C-Reactive Protein (CRP)",
+    "unit": "mg/L",
+    "adult_male":   { "low": 0.0, "high": 10.0, "critical_low": null, "critical_high": 200.0 },
+    "adult_female": { "low": 0.0, "high": 10.0, "critical_low": null, "critical_high": 200.0 },
+    "pediatric":    { "low": 0.0, "high": 10.0, "critical_low": null, "critical_high": 200.0 },
+    "clinical_notes": "CRP >100 mg/L strongly suggests serious bacterial infection. Key biomarker for pneumonia severity."
+  },
+  "770-8": {
+    "display": "Neutrophil Percentage",
+    "unit": "%",
+    "adult_male":   { "low": 50.0, "high": 70.0, "critical_low": 20.0, "critical_high": 95.0 },
+    "adult_female": { "low": 50.0, "high": 70.0, "critical_low": 20.0, "critical_high": 95.0 },
+    "pediatric":    { "low": 45.0, "high": 70.0, "critical_low": 20.0, "critical_high": 95.0 },
+    "clinical_notes": "Neutrophilia >75% indicates bacterial infection. Neutropenia <40% suggests viral infection or bone marrow suppression."
+  },
+  "2069-3": {
+    "display": "Chloride",
+    "unit": "mEq/L",
+    "adult_male":   { "low": 98.0, "high": 106.0, "critical_low": 80.0, "critical_high": 120.0 },
+    "adult_female": { "low": 98.0, "high": 106.0, "critical_low": 80.0, "critical_high": 120.0 },
+    "pediatric":    { "low": 98.0, "high": 106.0, "critical_low": 80.0, "critical_high": 120.0 },
+    "clinical_notes": "Hyperchloremia may indicate metabolic acidosis. Hypochloremia may indicate metabolic alkalosis or vomiting."
+  },
+  "2947-0": {
+    "display": "Sodium",
+    "unit": "mEq/L",
+    "adult_male":   { "low": 136.0, "high": 145.0, "critical_low": 120.0, "critical_high": 160.0 },
+    "adult_female": { "low": 136.0, "high": 145.0, "critical_low": 120.0, "critical_high": 160.0 },
+    "pediatric":    { "low": 136.0, "high": 145.0, "critical_low": 120.0, "critical_high": 160.0 },
+    "clinical_notes": "Hyponatremia seen in SIADH, heart failure, cirrhosis. Critical <120 causes seizures, altered consciousness."
+  },
+  "3094-0": {
+    "display": "Blood Urea Nitrogen (BUN)",
+    "unit": "mg/dL",
+    "adult_male":   { "low": 7.0, "high": 20.0, "critical_low": null, "critical_high": 100.0 },
+    "adult_female": { "low": 7.0, "high": 20.0, "critical_low": null, "critical_high": 100.0 },
+    "pediatric":    { "low": 5.0, "high": 18.0, "critical_low": null, "critical_high": 80.0 },
+    "clinical_notes": "Elevated BUN indicates renal impairment or dehydration. BUN >20 mg/dL is a CURB-65 criterion for pneumonia severity."
+  },
+  "2019-8": {
+    "display": "PaCO2 (Arterial Carbon Dioxide)",
+    "unit": "mmHg",
+    "adult_male":   { "low": 35.0, "high": 45.0, "critical_low": 20.0, "critical_high": 70.0 },
+    "adult_female": { "low": 35.0, "high": 45.0, "critical_low": 20.0, "critical_high": 70.0 },
+    "pediatric":    { "low": 35.0, "high": 45.0, "critical_low": 20.0, "critical_high": 70.0 },
+    "clinical_notes": "Low PaCO2 indicates hyperventilation or compensation for metabolic acidosis. High PaCO2 indicates respiratory failure."
+  },
+  "2708-6": {
+    "display": "PaO2 (Arterial Oxygen Partial Pressure)",
+    "unit": "mmHg",
+    "adult_male":   { "low": 80.0, "high": 100.0, "critical_low": 60.0, "critical_high": null },
+    "adult_female": { "low": 80.0, "high": 100.0, "critical_low": 60.0, "critical_high": null },
+    "pediatric":    { "low": 80.0, "high": 100.0, "critical_low": 60.0, "critical_high": null },
+    "clinical_notes": "PaO2 <60 mmHg indicates respiratory failure. Used to calculate PaO2/FiO2 ratio for ARDS criteria."
+  }
+}

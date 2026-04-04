@@ -11,8 +11,10 @@ httpx
 redis[hiredis]
 
 # LangChain and LLMs
-langchain
+langchain 
+langchain-text-splitters 
 langchain-community
+langchain[google-genai]
 langgraph
 langsmith
 
@@ -32,10 +34,12 @@ tensorflow
 Pillow
 
 # FHIR client
-fhirclient
+fhirclient==4.2.1
 
 # Reading level analysis
 textstat
 
 # Environment variables
 python-dotenv
+
+"mcp[cli]" fastmcp
