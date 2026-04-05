@@ -8,7 +8,7 @@ from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 
-from models.diagnosis import DiagnosisOutput
+from shared.models import DiagnosisOutput
 from dotenv import load_dotenv
 load_dotenv()
 
