@@ -1,0 +1,21 @@
+[
+  "age",
+  "gender_male",
+  "wbc",
+  "creatinine",
+  "albumin",
+  "glucose",
+  "crp",
+  "hemoglobin",
+  "potassium",
+  "comorbidity_count",
+  "has_diabetes",
+  "has_ckd",
+  "has_chf",
+  "has_copd",
+  "has_atrial_fibrillation",
+  "med_count",
+  "critical_lab_count",
+  "on_anticoagulant",
+  "on_steroid"
+]
