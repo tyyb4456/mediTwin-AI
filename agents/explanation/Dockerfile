@@ -9,20 +9,20 @@ RUN pip install --no-cache-dir --timeout=300 \
     "uvicorn[standard]" \
     pydantic \
     pydantic-settings \
-    httpx \
-    "redis[hiredis]" \
+    xgboost \
     langchain \
     langchain-google-genai \
-    langgraph \
+    langchain-core \
     langsmith \
-    python-dotenv \
-    "fhirclient==4.2.1"
+    textstat \
+    python-dotenv
 
 COPY shared/ /app/shared/
-COPY agents/patient_context/ /app/agent/
+COPY agents/digital_twin/ /app/agents/digital_twin/
+COPY agents/explanation/ /app/agent/
 
 WORKDIR /app/agent
 
-EXPOSE 8001
+EXPOSE 8009
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8009"]

@@ -10,19 +10,18 @@ RUN pip install --no-cache-dir --timeout=300 \
     pydantic \
     pydantic-settings \
     httpx \
-    "redis[hiredis]" \
     langchain \
     langchain-google-genai \
-    langgraph \
+    langchain-core \
     langsmith \
-    python-dotenv \
-    "fhirclient==4.2.1"
+    langgraph \
+    python-dotenv
 
 COPY shared/ /app/shared/
-COPY agents/patient_context/ /app/agent/
+COPY orchestrator/ /app/orchestrator/
 
-WORKDIR /app/agent
+WORKDIR /app/orchestrator
 
-EXPOSE 8001
+EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

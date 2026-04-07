@@ -11,10 +11,10 @@ httpx
 redis[hiredis]
 
 # LangChain and LLMs
-langchain 
-langchain-text-splitters 
+langchain
+langchain-text-splitters
 langchain-community
-langchain[google-genai]
+langchain-google-genai
 langgraph
 langsmith
 
@@ -30,7 +30,7 @@ scikit-learn
 xgboost
 
 # Medical imaging
-tensorflow
+# tensorflow
 Pillow
 
 # FHIR client
@@ -42,4 +42,5 @@ textstat
 # Environment variables
 python-dotenv
 
-"mcp[cli]" fastmcp
+mcp[cli]
+fastmcp

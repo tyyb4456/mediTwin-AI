@@ -159,7 +159,7 @@ def run_unit_tests():
         detect_conflicts, route_consensus, get_max_severity,
         _codes_compatible, _icd_prefix, Conflict,
     )
-    from agents.orchestrator.main import compute_aggregate_confidence, run_consensus
+    from main import compute_aggregate_confidence, run_consensus
 
     print("=" * 60)
     print("Unit Tests — conflict_detector.py + main.py")

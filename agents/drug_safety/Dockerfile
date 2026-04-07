@@ -13,16 +13,18 @@ RUN pip install --no-cache-dir --timeout=300 \
     "redis[hiredis]" \
     langchain \
     langchain-google-genai \
-    langgraph \
+    langchain-core \
     langsmith \
     python-dotenv \
-    "fhirclient==4.2.1"
+    "mcp[cli]" \
+    fastmcp \
+    starlette
 
 COPY shared/ /app/shared/
-COPY agents/patient_context/ /app/agent/
+COPY agents/drug_safety/ /app/agent/
 
 WORKDIR /app/agent
 
-EXPOSE 8001
+EXPOSE 8004
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "main:combined_app", "--host", "0.0.0.0", "--port", "8004"]
