@@ -1,7 +1,25 @@
 version: '3.8'
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MediTwin AI — Docker Compose
+#
+# All build contexts are set to "." (project root) so Dockerfiles can
+# reference shared/, requirements.txt, and agent code via absolute paths
+# from root. This is the standard monorepo pattern for Docker.
+#
+# Usage:
+#   cp .env.example .env          # fill in OPENAI_API_KEY
+#   docker-compose up --build
+#
+# One-time setup (run before first docker-compose up):
+#   docker-compose run --rm diagnosis python /app/knowledge_base/ingest.py
+#   docker-compose run --rm digital-twin python /app/agents/digital_twin/train_models.py
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
-  # Infrastructure Services
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
   redis:
     image: redis:7-alpine
     container_name: meditwin-redis
@@ -14,6 +32,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
   chromadb:
     image: chromadb/chroma:latest
@@ -32,12 +51,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 1: Patient Context Agent
+  # ── Agent 1: Patient Context Agent (port 8001) ──────────────────────────────
+
   patient-context:
     build:
-      context: ./agents/patient_context
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agents/patient_context/Dockerfile
     container_name: meditwin-patient-context
     ports:
       - "8001:8001"
@@ -45,6 +66,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - FHIR_BASE_URL=https://hapi.fhir.org/baseR4
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
       redis:
         condition: service_healthy
@@ -55,19 +77,21 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 2: Diagnosis Agent
+  # ── Agent 2: Diagnosis Agent (port 8002) ─────────────────────────────────────
+
   diagnosis:
     build:
-      context: ./agents/diagnosis
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agents/diagnosis/Dockerfile
     container_name: meditwin-diagnosis
     ports:
       - "8002:8002"
     environment:
       - CHROMADB_HOST=chromadb
       - CHROMADB_PORT=8000
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
       chromadb:
         condition: service_healthy
@@ -78,12 +102,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 3: Lab Analysis Agent
+  # ── Agent 3: Lab Analysis Agent (port 8003) ───────────────────────────────────
+
   lab-analysis:
     build:
-      context: ./agents/lab_analysis
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agents/lab_analysis/Dockerfile
     container_name: meditwin-lab-analysis
     ports:
       - "8003:8003"
@@ -96,19 +122,21 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 4: Drug Safety MCP
+  # ── Agent 4: Drug Safety MCP (port 8004) ──────────────────────────────────────
+
   drug-safety:
     build:
-      context: ./agents/drug_safety
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agents/drug_safety/Dockerfile
     container_name: meditwin-drug-safety
     ports:
       - "8004:8004"
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
       redis:
         condition: service_healthy
@@ -119,12 +147,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 5: Imaging Triage Agent
+  # ── Agent 5: Imaging Triage Agent (port 8005) ─────────────────────────────────
+
   imaging-triage:
     build:
-      context: ./agents/imaging_triage
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agents/imaging_triage/Dockerfile
     container_name: meditwin-imaging-triage
     ports:
       - "8005:8005"
@@ -135,12 +165,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 6: Digital Twin Agent
+  # ── Agent 6: Digital Twin Agent (port 8006) ───────────────────────────────────
+
   digital-twin:
     build:
-      context: ./agents/digital_twin
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agents/digital_twin/Dockerfile
     container_name: meditwin-digital-twin
     ports:
       - "8006:8006"
@@ -153,17 +185,24 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 8: Explanation Agent
-  explanation:
+  # ── Agent 7: Consensus + Escalation Agent (port 8007) ────────────────────────
+
+  consensus:
     build:
-      context: ./agents/explanation
-      dockerfile: Dockerfile
-    container_name: meditwin-explanation
+      context: .
+      dockerfile: agents/consensus/Dockerfile
+    container_name: meditwin-consensus
     ports:
       - "8007:8007"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CHROMADB_HOST=chromadb
+      - CHROMADB_PORT=8000
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    depends_on:
+      chromadb:
+        condition: service_healthy
     networks:
       - meditwin-network
     healthcheck:
@@ -171,12 +210,34 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Agent 9: Orchestrator (Main Entry Point)
+  # ── Agent 8: Explanation Agent (port 8009) ────────────────────────────────────
+
+  explanation:
+    build:
+      context: .
+      dockerfile: agents/explanation/Dockerfile
+    container_name: meditwin-explanation
+    ports:
+      - "8009:8009"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      - meditwin-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Agent 9: Orchestrator — Main Entry Point (port 8000) ──────────────────────
+
   orchestrator:
     build:
-      context: ./orchestrator
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: orchestrator/Dockerfile
     container_name: meditwin-orchestrator
     ports:
       - "8000:8000"
@@ -187,8 +248,9 @@ services:
       - DRUG_SAFETY_URL=http://drug-safety:8004
       - IMAGING_TRIAGE_URL=http://imaging-triage:8005
       - DIGITAL_TWIN_URL=http://digital-twin:8006
-      - EXPLANATION_URL=http://explanation:8007
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CONSENSUS_URL=http://consensus:8007
+      - EXPLANATION_URL=http://explanation:8009
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
       patient-context:
         condition: service_healthy
@@ -202,6 +264,8 @@ services:
         condition: service_healthy
       digital-twin:
         condition: service_healthy
+      consensus:
+        condition: service_healthy
       explanation:
         condition: service_healthy
     networks:
@@ -211,6 +275,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
 networks:
   meditwin-network:
