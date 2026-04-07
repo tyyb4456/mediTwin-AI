@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from shared.models import PatientState
 
 # Import the RAG chain (singleton)
-from agents.rag import diagnosis
+from rag import diagnosis
 
 
 # ── Request / Response Models ──────────────────────────────────────────────────
