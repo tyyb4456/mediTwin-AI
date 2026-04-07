@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir --timeout=300 \
 COPY shared/ /app/shared/
 COPY agents/lab_analysis/ /app/agent/
 
+ENV PYTHONPATH=/app  
+
 WORKDIR /app/agent
 
 EXPOSE 8003

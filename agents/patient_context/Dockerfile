@@ -21,6 +21,8 @@ RUN pip install --no-cache-dir --timeout=300 \
 COPY shared/ /app/shared/
 COPY agents/patient_context/ /app/agent/
 
+ENV PYTHONPATH=/app 
+
 WORKDIR /app/agent
 
 EXPOSE 8001

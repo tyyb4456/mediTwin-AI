@@ -21,6 +21,8 @@ RUN pip install --no-cache-dir --timeout=300 \
 COPY shared/ /app/shared/
 COPY agents/consensus/ /app/agent/
 
+ENV PYTHONPATH=/app 
+
 WORKDIR /app/agent
 
 EXPOSE 8007

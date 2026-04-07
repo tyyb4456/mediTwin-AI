@@ -26,6 +26,8 @@ WORKDIR /app/agent
 
 RUN python train_models.py
 
+ENV PYTHONPATH=/app
+
 EXPOSE 8006
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8006"]

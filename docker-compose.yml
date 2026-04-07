@@ -46,11 +46,6 @@ services:
       - CHROMA_SERVER_HTTP_PORT=8000
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     restart: unless-stopped
 
   # ── Agent 1: Patient Context Agent (port 8001) ──────────────────────────────
@@ -93,8 +88,7 @@ services:
       - CHROMADB_PORT=8000
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
-      chromadb:
-        condition: service_healthy
+      - chromadb
     networks:
       - meditwin-network
     healthcheck:
@@ -114,7 +108,7 @@ services:
     ports:
       - "8003:8003"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
     healthcheck:
@@ -177,7 +171,7 @@ services:
     ports:
       - "8006:8006"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
     healthcheck:
@@ -201,8 +195,7 @@ services:
       - CHROMADB_PORT=8000
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
-      chromadb:
-        condition: service_healthy
+      - chromadb
     networks:
       - meditwin-network
     healthcheck:
@@ -222,7 +215,7 @@ services:
     ports:
       - "8009:8009"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
     healthcheck:

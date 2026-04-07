@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir --timeout=300 \
     "uvicorn[standard]" \
     pydantic \
     pydantic-settings \
-    xgboost \
+    xgboost-cpu \
     langchain \
     langchain-google-genai \
     langchain-core \
@@ -20,6 +20,8 @@ RUN pip install --no-cache-dir --timeout=300 \
 COPY shared/ /app/shared/
 COPY agents/digital_twin/ /app/agents/digital_twin/
 COPY agents/explanation/ /app/agent/
+
+ENV PYTHONPATH=/app  
 
 WORKDIR /app/agent
 

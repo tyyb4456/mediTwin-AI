@@ -23,6 +23,8 @@ COPY shared/ /app/shared/
 COPY knowledge_base/ /app/knowledge_base/
 COPY agents/diagnosis/ /app/agent/
 
+ENV PYTHONPATH=/app  
+
 WORKDIR /app/agent
 
 EXPOSE 8002
