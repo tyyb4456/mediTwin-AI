@@ -63,6 +63,10 @@ async def check_rxnav_interactions(rxcui_list: list[str]) -> list[dict]:
     """
     Check drug-drug interactions for a list of RxCUI codes using NLM RxNav.
     Returns a list of interaction dicts.
+
+    IMPORTANT: RxNav requires literal '+' as the RxCUI separator in the URL.
+    httpx's params= dict encodes '+' to '%2B' which causes a 404.
+    Solution: build the full URL string manually so '+' is never encoded.
     """
     if len(rxcui_list) < 2:
         return []  # Need at least 2 drugs to check
@@ -71,12 +75,11 @@ async def check_rxnav_interactions(rxcui_list: list[str]) -> list[dict]:
 
     try:
         async with httpx.AsyncClient() as client:
-            url = f"{RXNAV_BASE}/interaction/list.json"
-            resp = await client.get(
-                url,
-                params={"rxcuis": rxcuis_str},
-                timeout=TIMEOUT
-            )
+            # NOTE: Do NOT use params={"rxcuis": rxcuis_str} here.
+            # httpx percent-encodes '+' → '%2B', but RxNav requires literal '+'.
+            # Passing the full URL string bypasses that encoding.
+            url = f"{RXNAV_BASE}/interaction/list.json?rxcuis={rxcuis_str}"
+            resp = await client.get(url, timeout=TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
 

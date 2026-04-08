@@ -48,6 +48,34 @@ services:
       - meditwin-network
     restart: unless-stopped
 
+# ── One-time setup: Knowledge Base Ingest ──
+  diagnosis-ingest:
+    build:
+      context: .
+      dockerfile: agents/diagnosis/Dockerfile
+    container_name: meditwin-diagnosis-ingest
+    command: python /app/knowledge_base/ingest.py
+    environment:
+      - CHROMADB_HOST=chromadb
+      - CHROMADB_PORT=8000
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    depends_on:
+      - chromadb
+    networks:
+      - meditwin-network
+    restart: "no"  # Run once and exit
+
+  # ── One-time setup: Digital Twin Model Training ──
+  digital-twin-train:
+    build:
+      context: .
+      dockerfile: agents/digital_twin/Dockerfile
+    container_name: meditwin-digital-twin-train
+    command: python /app/agent/train_models.py
+    networks:
+      - meditwin-network
+    restart: "no"  # Run once and exit
+
   # ── Agent 1: Patient Context Agent (port 8001) ──────────────────────────────
 
   patient-context:
@@ -89,6 +117,7 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
       - chromadb
+      - diagnosis-ingest  # waits for ingest to complete
     networks:
       - meditwin-network
     # healthcheck:
@@ -172,6 +201,9 @@ services:
       - "8006:8006"
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+
+    depends_on:
+      - digital-twin-train  # waits for training to complete
     networks:
       - meditwin-network
     # healthcheck:
@@ -218,6 +250,9 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
+
+    depends_on:
+      - digital-twin-train  # ← add this
     # healthcheck:
     #   test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
     #   interval: 60s
