@@ -70,7 +70,7 @@ SAMPLE_PATIENT_STATE = {
     "imaging_available": False
 }
 
-AGENT_URL = "http://localhost:8000"
+AGENT_URL = "http://localhost:8002"
 
 
 async def test_diagnosis_agent():
@@ -78,7 +78,7 @@ async def test_diagnosis_agent():
     
     async with httpx.AsyncClient(timeout=60.0) as client:
         print("=" * 60)
-        print("Testing Diagnosis Agent — http://localhost:8000")
+        print("Testing Diagnosis Agent — http://localhost:8002")
         print("=" * 60)
         
         # ── Test 1: Health Check ──────────────────────────────────

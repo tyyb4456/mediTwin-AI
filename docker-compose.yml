@@ -29,7 +29,7 @@ services:
       - meditwin-network
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      interval: 60s
       timeout: 3s
       retries: 5
     restart: unless-stopped
@@ -67,11 +67,11 @@ services:
         condition: service_healthy
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 2: Diagnosis Agent (port 8002) ─────────────────────────────────────
@@ -91,11 +91,11 @@ services:
       - chromadb
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 3: Lab Analysis Agent (port 8003) ───────────────────────────────────
@@ -111,11 +111,11 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+      # test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      # interval: 60s
+      # timeout: 5s
+      # retries: 5
     restart: unless-stopped
 
   # ── Agent 4: Drug Safety MCP (port 8004) ──────────────────────────────────────
@@ -136,11 +136,11 @@ services:
         condition: service_healthy
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 5: Imaging Triage Agent (port 8005) ─────────────────────────────────
@@ -154,11 +154,11 @@ services:
       - "8005:8005"
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 6: Digital Twin Agent (port 8006) ───────────────────────────────────
@@ -174,11 +174,11 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 7: Consensus + Escalation Agent (port 8007) ────────────────────────
@@ -198,11 +198,11 @@ services:
       - chromadb
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 8: Explanation Agent (port 8009) ────────────────────────────────────
@@ -218,57 +218,49 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 9: Orchestrator — Main Entry Point (port 8000) ──────────────────────
 
   orchestrator:
-    build:
-      context: .
-      dockerfile: orchestrator/Dockerfile
-    container_name: meditwin-orchestrator
-    ports:
-      - "8000:8000"
-    environment:
-      - PATIENT_CONTEXT_URL=http://patient-context:8001
-      - DIAGNOSIS_URL=http://diagnosis:8002
-      - LAB_ANALYSIS_URL=http://lab-analysis:8003
-      - DRUG_SAFETY_URL=http://drug-safety:8004
-      - IMAGING_TRIAGE_URL=http://imaging-triage:8005
-      - DIGITAL_TWIN_URL=http://digital-twin:8006
-      - CONSENSUS_URL=http://consensus:8007
-      - EXPLANATION_URL=http://explanation:8009
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-    depends_on:
-      patient-context:
-        condition: service_healthy
-      diagnosis:
-        condition: service_healthy
-      lab-analysis:
-        condition: service_healthy
-      drug-safety:
-        condition: service_healthy
-      imaging-triage:
-        condition: service_healthy
-      digital-twin:
-        condition: service_healthy
-      consensus:
-        condition: service_healthy
-      explanation:
-        condition: service_healthy
-    networks:
-      - meditwin-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      build:
+        context: .
+        dockerfile: orchestrator/Dockerfile
+      container_name: meditwin-orchestrator
+      ports:
+        - "8000:8000"
+      environment:
+        - PATIENT_CONTEXT_URL=http://patient-context:8001
+        - DIAGNOSIS_URL=http://diagnosis:8002
+        - LAB_ANALYSIS_URL=http://lab-analysis:8003
+        - DRUG_SAFETY_URL=http://drug-safety:8004
+        - IMAGING_TRIAGE_URL=http://imaging-triage:8005
+        - DIGITAL_TWIN_URL=http://digital-twin:8006
+        - CONSENSUS_URL=http://consensus:8007
+        - EXPLANATION_URL=http://explanation:8009
+        - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      depends_on:
+        - patient-context
+        - diagnosis
+        - lab-analysis
+        - drug-safety
+        - imaging-triage
+        - digital-twin
+        - consensus
+        - explanation
+      networks:
+        - meditwin-network
+      # healthcheck:
+      #   test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      #   interval: 60s
+      #   timeout: 5s
+      #   retries: 5
+      restart: unless-stopped
 
 networks:
   meditwin-network:

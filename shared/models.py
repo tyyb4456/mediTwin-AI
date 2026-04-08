@@ -133,14 +133,23 @@ class PatientState(BaseModel):
 
 
 # Agent Output Models
+class DiagnosisItem(BaseModel):
+    rank: int
+    display: str
+    icd10_code: str
+    confidence: float
+    clinical_reasoning: str
+    supporting_evidence: List[str] = []
+    against_evidence: List[str] = []
+
 class DiagnosisOutput(BaseModel):
     """Output from Diagnosis Agent"""
-    differential_diagnosis: List[Dict[str, Any]]
-    top_diagnosis: str
+    differential_diagnosis: List[DiagnosisItem]
+    top_diagnosis: str = ""
+    top_icd10_code: str = ""
     confidence_level: str
     reasoning_summary: str
     recommended_next_steps: List[str]
-
 
 class LabAnalysisOutput(BaseModel):
     """Output from Lab Analysis Agent"""

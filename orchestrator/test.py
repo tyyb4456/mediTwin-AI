@@ -32,9 +32,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_unit_tests():
-    from orchestrator.state import MediTwinState
-    from orchestrator.graph import build_meditwin_graph, _fallback_consensus
-    from orchestrator.agent_callers import (
+    from state import MediTwinState
+    from graph import build_meditwin_graph, _fallback_consensus
+    from agent_callers import (
         PATIENT_CONTEXT_URL, DIAGNOSIS_URL, LAB_ANALYSIS_URL,
         DRUG_SAFETY_URL, IMAGING_TRIAGE_URL, DIGITAL_TWIN_URL,
         CONSENSUS_URL, EXPLANATION_URL,

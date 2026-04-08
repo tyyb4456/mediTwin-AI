@@ -30,8 +30,8 @@ from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from orchestrator.graph import build_meditwin_graph
-from orchestrator.agent_callers import (
+from graph import build_meditwin_graph
+from agent_callers import (
     PATIENT_CONTEXT_URL, DIAGNOSIS_URL, LAB_ANALYSIS_URL,
     DRUG_SAFETY_URL, IMAGING_TRIAGE_URL, DIGITAL_TWIN_URL,
     CONSENSUS_URL, EXPLANATION_URL,
