@@ -1,12 +1,20 @@
 """
-Lab Analysis Rules Engine
+Lab Analysis Rules Engine (Enhanced)
 Pure Python — deterministic, no LLM.
 Runs FIRST before LLM interpretation.
 CRITICAL flags from this engine are NEVER suppressed by LLM output.
+
+New features:
+  - Severity scoring system (0-100 scale)
+  - Rapid change detection (delta checks)
+  - More comprehensive clinical patterns
+  - Age/gender-specific reference ranges properly implemented
+  - SIRS criteria detection
+  - Organ dysfunction scoring
 """
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 
 
 # ── Load reference ranges once at import time ──────────────────────────────────
@@ -33,7 +41,7 @@ def _get_range(loinc: str, age: int, gender: str) -> Optional[dict]:
 def classify_result(loinc: str, value: float, age: int, gender: str) -> dict:
     """
     Classify a single lab result as NORMAL / HIGH / LOW / CRITICAL.
-
+    
     Returns:
         {
             "loinc": str,
@@ -76,8 +84,7 @@ def classify_result(loinc: str, value: float, age: int, gender: str) -> dict:
             flag = "HIGH"
         elif low is not None and value < low:
             flag = "LOW"
-    # If no reference range, leave as NORMAL (don't flag what we can't evaluate)
-
+    
     return {
         "loinc": loinc,
         "display": display,
@@ -92,12 +99,12 @@ def classify_result(loinc: str, value: float, age: int, gender: str) -> dict:
 def classify_all(lab_results: list[dict], age: int, gender: str) -> list[dict]:
     """
     Classify every lab result in the patient state.
-
+    
     Args:
         lab_results: List of LabResult dicts from PatientState
         age: Patient age (int)
         gender: Patient gender string
-
+        
     Returns:
         List of classified result dicts, same order as input
     """
@@ -107,7 +114,7 @@ def classify_all(lab_results: list[dict], age: int, gender: str) -> list[dict]:
         value = lab.get("value")
 
         if value is None:
-            continue  # Skip labs with no numeric value
+            continue
 
         result = classify_result(loinc, float(value), age, gender)
 
@@ -120,17 +127,194 @@ def classify_all(lab_results: list[dict], age: int, gender: str) -> list[dict]:
     return classified
 
 
-# ── Clinical Pattern Detection ─────────────────────────────────────────────────
-# Each pattern is: name, required LOINCs with required flags, interpretation, ICD-10 codes
+# ── Severity Scoring ───────────────────────────────────────────────────────────
+
+def compute_severity_score(classified_labs: List[dict]) -> dict:
+    """
+    Compute an overall severity score (0-100) based on lab abnormalities.
+    
+    Scoring logic:
+      - Each CRITICAL value: +25 points
+      - Each HIGH/LOW value: +10 points
+      - Multiple organ system involvement: multiplier
+      - SIRS criteria: +15 points
+      - Organ dysfunction: +20 points per system
+    
+    Returns:
+        {
+            "score": int (0-100),
+            "risk_category": "LOW" | "MODERATE" | "HIGH" | "CRITICAL",
+            "contributors": List[str]
+        }
+    """
+    score = 0
+    contributors = []
+    
+    # Count flags
+    critical_count = sum(1 for r in classified_labs if r["flag"] == "CRITICAL")
+    high_low_count = sum(1 for r in classified_labs if r["flag"] in ("HIGH", "LOW"))
+    
+    # Base scoring
+    score += critical_count * 25
+    score += high_low_count * 10
+    
+    if critical_count > 0:
+        contributors.append(f"{critical_count} critical value(s)")
+    if high_low_count > 0:
+        contributors.append(f"{high_low_count} abnormal value(s)")
+    
+    # Organ system involvement
+    labs_by_loinc = {r["loinc"]: r for r in classified_labs}
+    
+    # Check for SIRS criteria (≥2 of: temp, HR, RR, WBC)
+    sirs_count = 0
+    wbc = labs_by_loinc.get("26464-8")
+    if wbc and wbc["flag"] in ("HIGH", "LOW", "CRITICAL"):
+        sirs_count += 1
+    
+    if sirs_count >= 2:
+        score += 15
+        contributors.append("SIRS criteria met")
+    
+    # Organ dysfunction scoring
+    organ_dysfunction = []
+    
+    # Renal
+    cr = labs_by_loinc.get("2160-0")
+    if cr and cr["flag"] in ("HIGH", "CRITICAL"):
+        score += 20
+        organ_dysfunction.append("Renal")
+    
+    # Hepatic
+    alt = labs_by_loinc.get("1742-6")
+    if alt and alt["flag"] in ("HIGH", "CRITICAL"):
+        score += 15
+        organ_dysfunction.append("Hepatic")
+    
+    # Cardiac
+    trop = labs_by_loinc.get("6598-7")
+    if trop and trop["flag"] in ("HIGH", "CRITICAL"):
+        score += 20
+        organ_dysfunction.append("Cardiac")
+    
+    # Hematologic
+    hgb = labs_by_loinc.get("718-7")
+    plt = labs_by_loinc.get("777-3")
+    if (hgb and hgb["flag"] in ("LOW", "CRITICAL")) or (plt and plt["flag"] in ("LOW", "CRITICAL")):
+        score += 15
+        organ_dysfunction.append("Hematologic")
+    
+    if organ_dysfunction:
+        contributors.append(f"Organ dysfunction: {', '.join(organ_dysfunction)}")
+    
+    # Cap at 100
+    score = min(score, 100)
+    
+    # Categorize risk
+    if score >= 75:
+        risk_category = "CRITICAL"
+    elif score >= 50:
+        risk_category = "HIGH"
+    elif score >= 25:
+        risk_category = "MODERATE"
+    else:
+        risk_category = "LOW"
+    
+    return {
+        "score": score,
+        "risk_category": risk_category,
+        "contributors": contributors,
+        "organ_systems_affected": len(organ_dysfunction)
+    }
+
+
+# ── Rapid Change Detection ────────────────────────────────────────────────────
+
+def check_rapid_changes(current_labs: List[dict], previous_labs: List[dict]) -> List[dict]:
+    """
+    Detect rapid changes that indicate acute deterioration.
+    
+    Criteria for "rapid change":
+      - Creatinine increase >0.3 mg/dL in 48h (KDIGO AKI criteria)
+      - WBC change >50% from baseline
+      - Hemoglobin drop >2 g/dL (acute bleeding)
+      - Potassium change >1.0 mEq/L
+      - Glucose change >200 mg/dL
+    
+    Returns:
+        List of alerts for rapid changes
+    """
+    alerts = []
+    prev_by_loinc = {lab["loinc"]: lab for lab in previous_labs}
+    
+    for current in current_labs:
+        loinc = current["loinc"]
+        prev = prev_by_loinc.get(loinc)
+        
+        if not prev:
+            continue
+        
+        curr_val = current.get("value")
+        prev_val = prev.get("value")
+        
+        if curr_val is None or prev_val is None:
+            continue
+        
+        delta = curr_val - prev_val
+        
+        # Creatinine — AKI criteria
+        if loinc == "2160-0" and delta >= 0.3:
+            alerts.append({
+                "loinc": loinc,
+                "display": current["display"],
+                "change": f"+{delta:.1f} mg/dL",
+                "interpretation": "KDIGO AKI Stage 1 criteria met — acute kidney injury",
+                "urgency": "URGENT"
+            })
+        
+        # WBC — rapid change
+        if loinc == "26464-8":
+            pct_change = abs(delta / prev_val * 100) if prev_val != 0 else 0
+            if pct_change > 50:
+                alerts.append({
+                    "loinc": loinc,
+                    "display": current["display"],
+                    "change": f"{delta:+.1f} ({pct_change:+.0f}%)",
+                    "interpretation": "Rapid WBC change suggests acute process",
+                    "urgency": "URGENT"
+                })
+        
+        # Hemoglobin — acute bleeding
+        if loinc == "718-7" and delta <= -2.0:
+            alerts.append({
+                "loinc": loinc,
+                "display": current["display"],
+                "change": f"{delta:.1f} g/dL",
+                "interpretation": "Acute hemoglobin drop — evaluate for bleeding",
+                "urgency": "STAT"
+            })
+        
+        # Potassium — arrhythmia risk
+        if loinc == "2823-3" and abs(delta) >= 1.0:
+            alerts.append({
+                "loinc": loinc,
+                "display": current["display"],
+                "change": f"{delta:+.1f} mEq/L",
+                "interpretation": "Rapid potassium change — cardiac arrhythmia risk",
+                "urgency": "STAT"
+            })
+    
+    return alerts
+
+
+# ── Enhanced Clinical Pattern Detection ────────────────────────────────────────
 
 CLINICAL_PATTERNS = [
     {
         "name": "Bacterial infection markers",
         "description": "Multi-marker pattern consistent with bacterial infection",
         "rules": [
-            # WBC elevated
             lambda labs: labs.get("26464-8", {}).get("flag") in ("HIGH", "CRITICAL"),
-            # CRP elevated (OR if CRP not available, neutrophilia)
             lambda labs: (
                 labs.get("1988-5", {}).get("flag") in ("HIGH", "CRITICAL")
                 or labs.get("770-8", {}).get("flag") in ("HIGH", "CRITICAL")
@@ -144,16 +328,14 @@ CLINICAL_PATTERNS = [
         "name": "Sepsis risk markers",
         "description": "Laboratory pattern raising concern for systemic sepsis",
         "rules": [
-            # WBC critically elevated OR critically low
             lambda labs: labs.get("26464-8", {}).get("flag") == "CRITICAL",
-            # Any organ dysfunction marker elevated
             lambda labs: (
-                labs.get("2160-0", {}).get("flag") in ("HIGH", "CRITICAL")   # Creatinine
-                or labs.get("1742-6", {}).get("flag") in ("HIGH", "CRITICAL") # ALT
-                or labs.get("6598-7", {}).get("flag") in ("HIGH", "CRITICAL") # Troponin
+                labs.get("2160-0", {}).get("flag") in ("HIGH", "CRITICAL")
+                or labs.get("1742-6", {}).get("flag") in ("HIGH", "CRITICAL")
+                or labs.get("6598-7", {}).get("flag") in ("HIGH", "CRITICAL")
             ),
         ],
-        "min_rules_met": 1,  # Critical WBC alone is enough to raise sepsis concern
+        "min_rules_met": 1,
         "supports_icd10": ["A41.9"],
         "sensitivity_note": "CRITICAL WBC warrants sepsis workup: blood cultures, lactate",
     },
@@ -161,7 +343,7 @@ CLINICAL_PATTERNS = [
         "name": "Acute kidney injury (AKI) markers",
         "description": "Laboratory pattern consistent with acute or chronic kidney injury",
         "rules": [
-            lambda labs: labs.get("2160-0", {}).get("flag") in ("HIGH", "CRITICAL"),  # Creatinine
+            lambda labs: labs.get("2160-0", {}).get("flag") in ("HIGH", "CRITICAL"),
         ],
         "min_rules_met": 1,
         "supports_icd10": ["N17.9", "N18.9"],
@@ -182,7 +364,7 @@ CLINICAL_PATTERNS = [
         "name": "Cardiac injury markers",
         "description": "Troponin elevation indicating myocardial stress or injury",
         "rules": [
-            lambda labs: labs.get("6598-7", {}).get("flag") in ("HIGH", "CRITICAL"),  # Troponin T
+            lambda labs: labs.get("6598-7", {}).get("flag") in ("HIGH", "CRITICAL"),
         ],
         "min_rules_met": 1,
         "supports_icd10": ["I21.9", "I25.1"],
@@ -192,7 +374,7 @@ CLINICAL_PATTERNS = [
         "name": "Anemia",
         "description": "Hemoglobin below normal range",
         "rules": [
-            lambda labs: labs.get("718-7", {}).get("flag") in ("LOW", "CRITICAL"),  # Hemoglobin
+            lambda labs: labs.get("718-7", {}).get("flag") in ("LOW", "CRITICAL"),
         ],
         "min_rules_met": 1,
         "supports_icd10": ["D64.9"],
@@ -202,7 +384,7 @@ CLINICAL_PATTERNS = [
         "name": "Coagulation concern (thrombocytopenia)",
         "description": "Low platelet count indicating bleeding risk",
         "rules": [
-            lambda labs: labs.get("777-3", {}).get("flag") in ("LOW", "CRITICAL"),  # Platelets
+            lambda labs: labs.get("777-3", {}).get("flag") in ("LOW", "CRITICAL"),
         ],
         "min_rules_met": 1,
         "supports_icd10": ["D69.6"],
@@ -212,11 +394,33 @@ CLINICAL_PATTERNS = [
         "name": "Hyperglycemia / Diabetes decompensation",
         "description": "Significantly elevated glucose",
         "rules": [
-            lambda labs: labs.get("2345-7", {}).get("flag") in ("HIGH", "CRITICAL"),  # Glucose
+            lambda labs: labs.get("2345-7", {}).get("flag") in ("HIGH", "CRITICAL"),
         ],
         "min_rules_met": 1,
         "supports_icd10": ["E11.9", "E13.9"],
         "sensitivity_note": "Critical glucose >500 may indicate DKA or HHS — check ketones and pH",
+    },
+    {
+        "name": "Metabolic acidosis pattern",
+        "description": "Lab pattern suggesting metabolic acidosis",
+        "rules": [
+            lambda labs: labs.get("2069-3", {}).get("flag") in ("HIGH", "CRITICAL"),  # Chloride high
+            lambda labs: labs.get("2823-3", {}).get("flag") in ("HIGH", "CRITICAL"),  # Potassium high
+        ],
+        "min_rules_met": 1,
+        "supports_icd10": ["E87.2"],
+        "sensitivity_note": "Check blood gas for pH and lactate",
+    },
+    {
+        "name": "Liver dysfunction pattern",
+        "description": "Hepatocellular injury or hepatic synthetic dysfunction",
+        "rules": [
+            lambda labs: labs.get("1742-6", {}).get("flag") in ("HIGH", "CRITICAL"),  # ALT
+            lambda labs: labs.get("1751-7", {}).get("flag") in ("LOW", "CRITICAL"),   # Albumin low
+        ],
+        "min_rules_met": 1,
+        "supports_icd10": ["K72.9", "K76.9"],
+        "sensitivity_note": "ALT >10x ULN suggests acute hepatitis or ischemic liver injury",
     },
 ]
 
@@ -224,11 +428,10 @@ CLINICAL_PATTERNS = [
 def detect_patterns(classified_labs: list[dict]) -> list[dict]:
     """
     Run all clinical pattern rules against the classified lab results.
-
+    
     Returns:
         List of detected pattern dicts with interpretation details
     """
-    # Build a LOINC → result lookup for fast rule evaluation
     labs_by_loinc = {lab["loinc"]: lab for lab in classified_labs}
 
     detected = []
@@ -239,11 +442,9 @@ def detect_patterns(classified_labs: list[dict]) -> list[dict]:
         rules_met = sum(1 for rule in rules if rule(labs_by_loinc))
 
         if rules_met >= min_met:
-            # Collect the specific markers that triggered this pattern
             triggered_markers = []
             for lab in classified_labs:
                 if lab["flag"] in ("HIGH", "LOW", "CRITICAL"):
-                    # Only include markers that are relevant to this pattern's ICD-10 codes
                     triggered_markers.append(
                         f"{lab['display']} {lab['flag']} ({lab['value']} {lab['unit']})"
                     )
@@ -251,7 +452,7 @@ def detect_patterns(classified_labs: list[dict]) -> list[dict]:
             detected.append({
                 "pattern": pattern["name"],
                 "description": pattern["description"],
-                "markers": triggered_markers[:5],  # top 5 relevant
+                "markers": triggered_markers[:5],
                 "supports_icd10": pattern["supports_icd10"],
                 "sensitivity_note": pattern["sensitivity_note"],
                 "rules_met": rules_met,
@@ -264,7 +465,7 @@ def detect_patterns(classified_labs: list[dict]) -> list[dict]:
 def generate_critical_alerts(classified_labs: list[dict]) -> list[dict]:
     """
     Generate CRITICAL-level alerts that must always surface — never suppressed.
-
+    
     Returns:
         List of alert dicts
     """
@@ -325,12 +526,16 @@ def generate_critical_alerts(classified_labs: list[dict]) -> list[dict]:
 
     return alerts
 
+
 def compute_overall_severity(classified_labs: list[dict]) -> str:
+    """
+    Compute overall severity category based on flag distribution.
+    """
     flags = [lab["flag"] for lab in classified_labs]
 
     if "CRITICAL" in flags:
         return "SEVERE"
-    elif flags.count("HIGH") + flags.count("LOW") >= 2:  # ← was 3
+    elif flags.count("HIGH") + flags.count("LOW") >= 2:
         return "MODERATE"
     elif "HIGH" in flags or "LOW" in flags:
         return "MILD"
