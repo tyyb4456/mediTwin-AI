@@ -1,36 +1,39 @@
 """
-Agent 4: Drug Safety MCP Server
+Agent 4: Drug Safety MCP Server — v2.0
 Port: 8004
 
 DUAL PURPOSE:
   1. MCP Superpower — published to Prompt Opinion Marketplace.
-     Any agent on the platform can call our 3 tools:
-       - check_drug_interactions
-       - get_contraindications
-       - suggest_alternatives
+     Three tools: check_drug_interactions, get_contraindications, suggest_alternatives
 
-  2. A2A component inside MediTwin — the Orchestrator calls /check-safety
-     (REST endpoint) with the full patient context. The REST handler calls
-     the same core logic as the MCP tools, so there is ONE code path.
+  2. A2A component inside MediTwin — Orchestrator calls /check-safety (REST)
 
-Architecture decision:
-  - FastMCP for the MCP protocol layer (HTTP transport, recommended for 2025)
-  - FastAPI mounted alongside for the /check-safety REST endpoint + /health
-  - Redis for caching drug interaction results (TTL: 1 hour)
-  - All external API calls go through fda_client.py (async httpx)
-  - All local lookups go through safety_core.py (pure Python, no LLM)
-  - LLM only used for suggest_alternatives tool
+CHANGES IN v2.0:
+  - All LLM calls use llm.with_structured_output(PydanticModel) — no more JsonOutputParser
+  - FDA black box warnings fetched and integrated into safety pipeline
+  - LLM enriches interactions with mechanism, monitoring params, management strategy
+  - LLM generates patient-specific risk profile synthesizing ALL safety signals
+  - suggest_alternatives MCP tool is now properly async end-to-end
+  - Rich structured response includes patient_risk_profile and enriched_interactions
+  - Renal/hepatic impairment detection from conditions informs LLM context
+  - FHIR MedicationRequest output includes priority and AI extension
 
-Endpoints:
-  MCP:  POST /mcp/          (FastMCP streamable-HTTP)
-  REST: POST /check-safety  (Orchestrator calls this)
-  REST: GET  /health
+Architecture:
+  FastMCP (stateless HTTP) mounted at /mcp/
+  FastAPI REST endpoints at / (root)
+  Single combined Starlette ASGI app
+
+Safety pipeline order (all runs in parallel where possible):
+  1. Local checks: allergy cross-reactivity + condition contraindications (deterministic, fast)
+  2. External API: RxNav interaction check + FDA warnings fetch (concurrent)
+  3. Determine preliminary safety_status from deterministic findings
+  4. LLM enrichment: interaction clinical context + patient risk profile (concurrent, additive)
+  5. Assemble final response
 """
 import os
 import sys
 import json
 import asyncio
-from contextlib import asynccontextmanager
 from typing import Optional, Annotated
 
 import redis.asyncio as aioredis
@@ -38,16 +41,18 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
 from starlette.routing import Mount
 
-# Add parent directories to path for shared imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from fda_client import get_rxcuis_batch, check_rxnav_interactions
+from fda_client import get_rxcuis_batch, check_drug_interactions_by_name, get_fda_warnings_batch
 from safety_core import (
     check_allergy_cross_reactivity,
     check_condition_contraindications,
-    get_alternative_suggestions,
+    get_alternative_suggestions_async,
+    enrich_interactions_with_llm,
+    generate_patient_risk_profile,
     build_fhir_medication_request,
 )
 
@@ -55,6 +60,7 @@ from safety_core import (
 # ── Redis cache setup ─────────────────────────────────────────────────────────
 
 _redis: Optional[aioredis.Redis] = None
+
 
 async def get_redis() -> Optional[aioredis.Redis]:
     global _redis
@@ -93,7 +99,9 @@ async def cache_set(key: str, value: dict, ttl: int = 3600):
         pass
 
 
-# ── Core safety check function (shared by MCP tools and REST endpoint) ─────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Core safety pipeline (shared by MCP tools AND REST endpoint)
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def _run_full_safety_check(
     proposed_medications: list[str],
@@ -101,117 +109,228 @@ async def _run_full_safety_check(
     patient_allergies: list[dict],   # [{substance, reaction, severity}]
     active_conditions: list[dict],   # [{code, display}]
     patient_id: str = "unknown",
+    patient_state: Optional[dict] = None,   # Full PatientState for LLM enrichment
+    enrich_with_llm: bool = True,
 ) -> dict:
     """
-    Full drug safety pipeline. Called by both MCP tools and REST endpoint.
+    Full drug safety pipeline.
 
-    Steps:
-      1. Check allergy cross-reactivity for each proposed drug (local, fast)
-      2. Check condition contraindications for each proposed drug (local, fast)
-      3. Check drug-drug interactions via NLM RxNav (async API call)
-      4. Determine overall safety status
-      5. Build FHIR MedicationRequest resources for cleared drugs
+    Phase 1 — Deterministic (fast, always runs):
+      1a. Allergy cross-reactivity check (local table)
+      1b. Condition contraindication check (local JSON)
+
+    Phase 2 — External APIs (concurrent):
+      2a. NLM RxNav drug-drug interaction check
+      2b. FDA OpenFDA black box / label warnings
+
+    Phase 3 — Safety status (from deterministic findings)
+
+    Phase 4 — LLM enrichment (concurrent, additive — never overrides rules):
+      4a. Clinical interaction enrichment (mechanism, monitoring, management)
+      4b. Patient-specific risk profile (synthesizes all signals)
+
+    Phase 5 — Assemble response
     """
     all_drugs = proposed_medications + current_medications
-    cache_key = f"drug_safety:{':'.join(sorted(all_drugs))}:{':'.join(sorted(a.get('substance','') for a in patient_allergies))}"
+    # Cache key: drug combo + allergies (LLM enrichment NOT cached — patient-specific)
+    cache_key = (
+        f"drug_safety_v2:"
+        f"{':'.join(sorted(all_drugs))}:"
+        f"{':'.join(sorted(a.get('substance','') for a in patient_allergies))}"
+    )
 
-    # Cache hit?
-    cached = await cache_get(cache_key)
-    if cached:
-        print(f"  ✓ Cache hit for drug safety check")
-        return cached
+    # Only cache the non-LLM parts (deterministic + external API results)
+    base_cached = await cache_get(cache_key)
 
-    critical_interactions = []
+    if base_cached and not enrich_with_llm:
+        print("  ✓ Full cache hit")
+        return base_cached
+# rxnav_interactions 
+    # ── Phase 1: Deterministic local checks ──────────────────────────────────
+    print("  Phase 1: Running deterministic safety checks...")
     contraindications = []
     approved = []
     flagged = []
 
-    # ── Step 1 + 2: Local checks for each proposed drug ─────────────────────
     for drug in proposed_medications:
-        drug_contraindications = []
+        drug_contras = []
+        drug_contras.extend(check_allergy_cross_reactivity(drug, patient_allergies))
+        drug_contras.extend(check_condition_contraindications(drug, active_conditions))
 
-        # Allergy cross-reactivity
-        allergy_contras = check_allergy_cross_reactivity(drug, patient_allergies)
-        drug_contraindications.extend(allergy_contras)
-
-        # Condition contraindications
-        condition_contras = check_condition_contraindications(drug, active_conditions)
-        drug_contraindications.extend(condition_contras)
-
-        if drug_contraindications:
-            contraindications.extend(drug_contraindications)
+        if drug_contras:
+            contraindications.extend(drug_contras)
             flagged.append(drug)
         else:
             approved.append(drug)
 
-    # ── Step 3: Drug-drug interaction check via RxNav ─────────────────────────
+    # ── Phase 2: Concurrent external API calls ────────────────────────────────
+    print("  Phase 2: Fetching external safety data (RxNav + FDA)...")
+
+    rxcui_map: dict = {}
+    rxnav_interactions: list = []
+    fda_warnings: dict = {}
+
     if len(all_drugs) >= 2:
-        print(f"  Resolving RxCUIs for {all_drugs}...")
-        rxcui_map = await get_rxcuis_batch(all_drugs)
+        rxcui_map, fda_warnings = await asyncio.gather(
+            get_rxcuis_batch(all_drugs),
+            get_fda_warnings_batch(proposed_medications),  # Only check proposed drugs
+        )
         rxcuis = [v for v in rxcui_map.values() if v]
-
         if len(rxcuis) >= 2:
-            print(f"  Checking RxNav interactions for {len(rxcuis)} RxCUIs...")
-            rxnav_interactions = await check_rxnav_interactions(rxcuis)
-            critical_interactions.extend(rxnav_interactions)
+            print(f"  Resolved {len(rxcuis)}/{len(all_drugs)} drugs to RxCUI — checking interactions...")
+            rxnav_interactions = await check_drug_interactions_by_name(all_drugs)
         else:
-            print(f"  ⚠️  Only {len(rxcuis)} RxCUI(s) resolved — skipping interaction check")
+            print(f"  ⚠️  Only {len(rxcuis)} RxCUI(s) resolved — skipping RxNav interaction check")
     else:
-        rxnav_interactions = []
+        fda_warnings = await get_fda_warnings_batch(proposed_medications)
 
-    # ── Step 4: Determine overall safety status ───────────────────────────────
+    # ── Phase 3: Determine safety status ─────────────────────────────────────
     has_critical_contra = any(
         c.get("severity") in ("CRITICAL", "HIGH") for c in contraindications
     )
     has_severe_interaction = any(
         i.get("severity", "").upper() in ("HIGH", "CRITICAL")
-        for i in critical_interactions
+        for i in rxnav_interactions
+    )
+    has_black_box = any(
+        any("[BLACK BOX]" in w for w in warnings)
+        for warnings in fda_warnings.values()
+        if warnings
     )
 
-    safety_status = "UNSAFE" if (has_critical_contra or has_severe_interaction) else "SAFE"
-    if contraindications and not has_critical_contra:
-        safety_status = "CAUTION"  # Low-severity issues — proceed with monitoring
+    if has_critical_contra or has_severe_interaction:
+        safety_status = "UNSAFE"
+    elif contraindications or rxnav_interactions or has_black_box:
+        safety_status = "CAUTION"
+    else:
+        safety_status = "SAFE"
 
-    # ── Step 5: FHIR MedicationRequests for approved drugs ───────────────────
+    # ── Phase 4: LLM enrichment (concurrent, non-blocking) ───────────────────
+    enriched_interactions = None
+    patient_risk_profile = None
+    interaction_enrichment = None   # ← ADD THIS LINE
+    risk_profile = None      # ← ADD THIS LINE
+
+    # Build a minimal patient_state if not provided (for LLM context)
+    _patient_ctx = patient_state or {
+        "demographics": {"age": "unknown", "gender": "unknown"},
+        "active_conditions": active_conditions,
+        "medications": [{"drug": m} for m in current_medications],
+        "allergies": patient_allergies,
+    }
+
+    if enrich_with_llm:
+        print("  Phase 4: LLM enrichment (interactions + risk profile)...")
+        llm_tasks = [
+            enrich_interactions_with_llm(rxnav_interactions, _patient_ctx),
+            generate_patient_risk_profile(
+                patient_state=_patient_ctx,
+                proposed_medications=proposed_medications,
+                contraindications=contraindications,
+                interactions=rxnav_interactions,
+                fda_warnings=fda_warnings,
+                safety_status=safety_status,
+            ),
+        ]
+        interaction_enrichment, risk_profile = await asyncio.gather(*llm_tasks)
+
+        if interaction_enrichment:
+            enriched_interactions = interaction_enrichment.model_dump()
+        if risk_profile:
+            patient_risk_profile = risk_profile.model_dump()
+
+    # ── Phase 5: Assemble FHIR MedicationRequests for cleared drugs ───────────
+    risk_level = (
+        patient_risk_profile.get("overall_risk_level", "LOW")
+        if patient_risk_profile else "LOW"
+    )
+
     fhir_medication_requests = []
     for drug in approved:
-        note = "No contraindications or allergies detected."
-        if any(i.get("severity", "").upper() == "MODERATE" for i in critical_interactions):
-            note = "Moderate drug interaction detected — monitor closely."
+        interaction_note = ""
+        if any(i.get("severity", "").upper() == "MODERATE" for i in rxnav_interactions):
+            interaction_note = "Moderate drug interaction detected — monitor per clinician guidance."
         fhir_medication_requests.append(
-            build_fhir_medication_request(drug, patient_id, safety_cleared=True, safety_note=note)
+            build_fhir_medication_request(
+                drug, patient_id,
+                safety_cleared=True,
+                safety_note=interaction_note,
+                risk_level=risk_level,
+            )
         )
+
+    # ── Merge LLM enrichment into interaction list ───────────────────────────
+    enriched_rxnav = list(rxnav_interactions)
+    if interaction_enrichment and interaction_enrichment.enriched_interactions:
+        for i, enrichment in enumerate(interaction_enrichment.enriched_interactions):
+            if i < len(enriched_rxnav):
+                enriched_rxnav[i] = {
+                    **enriched_rxnav[i],
+                    "mechanism":             enrichment.mechanism,
+                    "clinical_significance": enrichment.clinical_significance,
+                    "monitoring_parameters": enrichment.monitoring_parameters,
+                    "management_strategy":   enrichment.management_strategy,
+                    "time_to_onset":         enrichment.time_to_onset,
+                }
 
     result = {
         "safety_status": safety_status,
-        "critical_interactions": critical_interactions,
-        "contraindications": contraindications,
-        "approved_medications": approved,
-        "flagged_medications": flagged,
+
+        # Core safety findings (deterministic)
+        "contraindications":       contraindications,
+        "critical_interactions":   enriched_rxnav,
+
+        # External data
+        "fda_warnings":            fda_warnings,
+        "rxcui_map":               rxcui_map,
+
+        # Medication verdicts
+        "approved_medications":    approved,
+        "flagged_medications":     flagged,
         "fhir_medication_requests": fhir_medication_requests,
+
+        # LLM-generated patient-specific assessment
+        "patient_risk_profile": patient_risk_profile,
+        "interaction_risk_narrative": (
+            interaction_enrichment.overall_risk_narrative
+            if interaction_enrichment else None
+        ),
+
+        # Summary counts
         "summary": {
-            "proposed_count": len(proposed_medications),
-            "approved_count": len(approved),
-            "flagged_count": len(flagged),
-            "interaction_count": len(critical_interactions),
+            "proposed_count":       len(proposed_medications),
+            "approved_count":       len(approved),
+            "flagged_count":        len(flagged),
+            "interaction_count":    len(rxnav_interactions),
             "contraindication_count": len(contraindications),
+            "black_box_warnings":   sum(
+                1 for w in fda_warnings.values()
+                if any("[BLACK BOX]" in x for x in w)
+            ),
+            "llm_enriched":         enrich_with_llm and patient_risk_profile is not None,
         },
     }
 
-    # Cache for 1 hour
-    await cache_set(cache_key, result, ttl=3600)
+    # Cache the base result (without LLM — patient-specific profiles shouldn't be cached)
+    base_result = {k: v for k, v in result.items()
+                   if k not in ("patient_risk_profile", "interaction_risk_narrative")}
+    await cache_set(cache_key, base_result, ttl=3600)
+
     return result
 
 
-# ── FastMCP: MCP Server with 3 tools ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# FastMCP — 3 MCP Tools
+# ══════════════════════════════════════════════════════════════════════════════
 
 mcp = FastMCP(
     name="drug-safety-mcp",
     instructions=(
         "Drug safety checker for clinical decision support. "
-        "Checks drug-drug interactions using NLM RxNav, allergy cross-reactivity, "
-        "and condition contraindications. Returns safety verdicts and safe alternatives. "
-        "SHARP context: pass patient_id to enable automatic medication list fetching."
+        "Checks drug-drug interactions (NLM RxNav), allergy cross-reactivity, "
+        "condition contraindications, and FDA black box warnings. "
+        "Returns safety verdicts, enriched clinical context, and safe alternatives. "
+        "SHARP context: pass patient_id to enable automatic patient data fetching."
     ),
     stateless_http=True,
     json_response=True,
@@ -222,40 +341,61 @@ mcp = FastMCP(
 async def check_drug_interactions(
     medications: Annotated[
         list[str],
-        Field(description="List of drug names to check for interactions. Include both proposed and current medications. Example: ['Amoxicillin 500mg', 'Warfarin 5mg', 'Metformin 850mg']")
+        Field(
+            description=(
+                "List of drug names to check for interactions. "
+                "Include both proposed and current medications. "
+                "Example: ['Amoxicillin 500mg', 'Warfarin 5mg', 'Metformin 850mg']"
+            )
+        )
     ],
     patient_id: Annotated[
         Optional[str],
-        Field(description="Optional FHIR patient ID. When provided with SHARP context, enables automatic patient medication list retrieval.")
+        Field(description="Optional FHIR patient ID. Enables SHARP context passthrough.")
     ] = None,
 ) -> dict:
     """
     Check for dangerous drug-drug interactions between a list of medications.
-    Uses NLM RxNav interaction database (free, no auth required).
-    Returns interactions with severity levels (HIGH/MODERATE/LOW) and clinical recommendations.
+    Uses FDA drug label warnings to detect cross-drug mentions.
+    Returns interactions with severity levels and LLM-enriched clinical context
+    (mechanism, monitoring parameters, management strategy).
     """
     if len(medications) < 2:
         return {"interactions": [], "message": "Need at least 2 medications to check interactions."}
 
-    rxcui_map = await get_rxcuis_batch(medications)
-    rxcuis = [v for v in rxcui_map.values() if v]
+    interactions = await check_drug_interactions_by_name(medications)
 
-    if len(rxcuis) < 2:
-        return {
-            "interactions": [],
-            "message": f"Could only resolve {len(rxcuis)} drug(s) to RxCUI codes. Check drug names.",
-            "resolved": rxcui_map,
-        }
+    # LLM enrichment — build minimal patient context
+    minimal_state = {
+        "demographics": {"age": "unknown", "gender": "unknown"},
+        "active_conditions": [],
+        "medications": [{"drug": m} for m in medications],
+        "allergies": [],
+    }
+    enrichment = await enrich_interactions_with_llm(interactions, minimal_state)
 
-    interactions = await check_rxnav_interactions(rxcuis)
+    enriched = list(interactions)
+    if enrichment:
+        for i, e in enumerate(enrichment.enriched_interactions):
+            if i < len(enriched):
+                enriched[i] = {
+                    **enriched[i],
+                    "mechanism": e.mechanism,
+                    "clinical_significance": e.clinical_significance,
+                    "monitoring_parameters": e.monitoring_parameters,
+                    "management_strategy": e.management_strategy,
+                    "time_to_onset": e.time_to_onset,
+                }
 
     return {
-        "medications_checked": medications,
-        "rxcui_resolved": rxcui_map,
-        "interactions": interactions,
-        "interaction_count": len(interactions),
-        "high_severity_count": sum(1 for i in interactions if i.get("severity", "").upper() in ("HIGH", "CRITICAL")),
-        "source": "NLM RxNav Interaction API",
+        "medications_checked":    medications,
+        "interactions":           enriched,
+        "interaction_count":      len(interactions),
+        "high_severity_count":    sum(
+            1 for i in interactions if i.get("severity", "").upper() in ("HIGH", "CRITICAL")
+        ),
+        "overall_risk_narrative": enrichment.overall_risk_narrative if enrichment else None,
+        "source":                 "FDA Drug Label Warnings + LLM Clinical Enrichment",
     }
 
 
@@ -263,39 +403,53 @@ async def check_drug_interactions(
 async def get_contraindications(
     drug_name: Annotated[
         str,
-        Field(description="Drug name to check. Include dose if known, e.g. 'Levofloxacin 750mg' or just 'Metformin'.")
+        Field(description="Drug name to check. Include dose if known, e.g. 'Levofloxacin 750mg'.")
     ],
     conditions: Annotated[
         Optional[list[str]],
-        Field(description="Patient's active ICD-10 condition codes. Example: ['N18.4', 'I50.9', 'J44.1']")
+        Field(description="Patient's active ICD-10 condition codes. Example: ['N18.4', 'I50.9']")
     ] = None,
     allergies: Annotated[
         Optional[list[str]],
-        Field(description="Patient's known allergens. Example: ['Penicillin', 'Sulfa', 'NSAIDs']")
+        Field(description="Patient's known allergens. Example: ['Penicillin', 'Sulfa']")
     ] = None,
 ) -> dict:
     """
     Check if a medication has contraindications for a patient's conditions or allergies.
-    Checks allergy cross-reactivity (e.g., Amoxicillin in Penicillin-allergic patient)
-    and condition contraindications (e.g., Metformin in severe CKD).
+    Checks allergy cross-reactivity and condition contraindications.
+    Also fetches FDA black box warnings for the drug.
     """
-    # Convert simple string lists to dicts expected by safety_core
-    allergy_dicts = [{"substance": a, "reaction": "unknown", "severity": "unknown"} for a in (allergies or [])]
+    allergy_dicts = [
+        {"substance": a, "reaction": "unknown", "severity": "unknown"}
+        for a in (allergies or [])
+    ]
     condition_dicts = [{"code": c, "display": c} for c in (conditions or [])]
 
-    allergy_contras = check_allergy_cross_reactivity(drug_name, allergy_dicts)
-    condition_contras = check_condition_contraindications(drug_name, condition_dicts)
+    # Run local checks + FDA warning fetch concurrently
+    allergy_contras, condition_contras, fda_w = await asyncio.gather(
+        asyncio.to_thread(check_allergy_cross_reactivity, drug_name, allergy_dicts),
+        asyncio.to_thread(check_condition_contraindications, drug_name, condition_dicts),
+        get_fda_warnings_batch([drug_name]),
+    )
 
     all_contras = allergy_contras + condition_contras
     has_critical = any(c.get("severity") in ("CRITICAL", "HIGH") for c in all_contras)
+    drug_fda_warnings = fda_w.get(drug_name, [])
+
+    overall_verdict = (
+        "UNSAFE" if has_critical else
+        ("CAUTION" if all_contras or drug_fda_warnings else "SAFE")
+    )
 
     return {
-        "drug": drug_name,
-        "overall_verdict": "UNSAFE" if has_critical else ("CAUTION" if all_contras else "SAFE"),
-        "contraindications": all_contras,
-        "contraindication_count": len(all_contras),
-        "allergy_contraindications": allergy_contras,
+        "drug":                        drug_name,
+        "overall_verdict":             overall_verdict,
+        "contraindications":           all_contras,
+        "contraindication_count":      len(all_contras),
+        "allergy_contraindications":   allergy_contras,
         "condition_contraindications": condition_contras,
+        "fda_warnings":                drug_fda_warnings,
+        "has_black_box_warning":       any("[BLACK BOX]" in w for w in drug_fda_warnings),
     }
 
 
@@ -315,27 +469,30 @@ async def suggest_alternatives(
     ],
     patient_conditions: Annotated[
         Optional[list[str]],
-        Field(description="Patient's ICD-10 condition codes for context. Example: ['J18.9', 'N18.3']")
+        Field(description="Patient's ICD-10 condition codes. Example: ['J18.9', 'N18.3']")
     ] = None,
     current_medications: Annotated[
         Optional[list[str]],
-        Field(description="Patient's current medications to check alternatives against. Example: ['Warfarin 5mg', 'Metformin 850mg']")
+        Field(description="Patient's current medications. Example: ['Warfarin 5mg', 'Metformin 850mg']")
     ] = None,
     patient_allergies: Annotated[
         Optional[list[str]],
-        Field(description="Known allergens to exclude from alternatives. Example: ['Penicillin', 'Sulfa']")
+        Field(description="Known allergens to exclude. Example: ['Penicillin', 'Sulfa']")
     ] = None,
 ) -> dict:
     """
     Suggest safe medication alternatives when a drug has contraindications or interactions.
-    Uses clinical LLM reasoning grounded in patient context.
-    Alternatives are checked against the patient's current medications and allergies.
+    Uses LLM with structured output for clinical reasoning.
+    Returns ranked alternatives with rationale, drug class, interaction checks needed, and urgency.
     """
     condition_dicts = [{"code": c, "display": c} for c in (patient_conditions or [])]
     med_dicts = [{"drug": m} for m in (current_medications or [])]
-    allergy_dicts = [{"substance": a, "reaction": "unknown", "severity": "unknown"} for a in (patient_allergies or [])]
+    allergy_dicts = [
+        {"substance": a, "reaction": "unknown", "severity": "unknown"}
+        for a in (patient_allergies or [])
+    ]
 
-    suggestions = get_alternative_suggestions(
+    result = await get_alternative_suggestions_async(
         drug_name=drug_name,
         reason_for_avoidance=reason_for_avoidance,
         indication=indication,
@@ -344,22 +501,27 @@ async def suggest_alternatives(
         allergies=allergy_dicts,
     )
 
-    if not suggestions:
+    if not result:
         return {
             "drug_to_replace": drug_name,
             "alternatives": [],
-            "error": "LLM alternative suggestion unavailable. OPENAI_API_KEY not set or API error.",
+            "error": "LLM alternative suggestion unavailable. GOOGLE_API_KEY not set or API error.",
         }
 
     return {
-        "drug_to_replace": drug_name,
+        "drug_to_replace":     drug_name,
         "reason_for_avoidance": reason_for_avoidance,
-        "indication": indication,
-        **suggestions,
+        "indication":          indication,
+        "alternatives":        [a.model_dump() for a in result.alternatives],
+        "clinical_note":       result.clinical_note,
+        "urgency":             result.urgency,
+        "source":              "LLM Clinical Pharmacist (Gemini 2.5 Flash)",
     }
 
 
-# ── FastAPI: REST endpoints for MediTwin Orchestrator ─────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# FastAPI REST — for MediTwin Orchestrator internal calls
+# ══════════════════════════════════════════════════════════════════════════════
 
 class SafetyCheckRequest(BaseModel):
     proposed_medications: list[str] = Field(
@@ -380,13 +542,20 @@ class SafetyCheckRequest(BaseModel):
         description="List of {code, display} ICD-10 condition dicts"
     )
     patient_id: str = Field(default="unknown")
+    patient_state: Optional[dict] = Field(
+        default=None,
+        description="Full PatientState object for richer LLM context (optional)"
+    )
+    enrich_with_llm: bool = Field(
+        default=True,
+        description="Set False to skip LLM enrichment (faster, for testing)"
+    )
 
 
-# Create FastAPI for the REST layer
 rest_app = FastAPI(
     title="MediTwin Drug Safety Agent",
-    description="Drug Safety MCP Server + REST API for MediTwin Orchestrator",
-    version="1.0.0",
+    description="Drug Safety MCP Server (v2.0) + REST API. LLM-enriched safety pipeline.",
+    version="2.0.0",
 )
 
 
@@ -394,7 +563,15 @@ rest_app = FastAPI(
 async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
     """
     Full drug safety check — called by MediTwin Orchestrator.
-    Combines allergy, condition, and interaction checks in one call.
+
+    Pipeline:
+      1. Allergy cross-reactivity (deterministic)
+      2. Condition contraindications (deterministic)
+      3. RxNav drug-drug interactions (external API)
+      4. FDA black box warnings (external API, concurrent with RxNav)
+      5. LLM interaction enrichment (structured Pydantic output)
+      6. LLM patient risk profile (structured Pydantic output)
+      7. FHIR MedicationRequest generation for cleared drugs
     """
     result = await _run_full_safety_check(
         proposed_medications=request.proposed_medications,
@@ -402,39 +579,46 @@ async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
         patient_allergies=request.patient_allergies,
         active_conditions=request.active_conditions,
         patient_id=request.patient_id,
+        patient_state=request.patient_state,
+        enrich_with_llm=request.enrich_with_llm,
     )
     return JSONResponse(content=result)
 
 
 @rest_app.get("/health")
 async def health() -> JSONResponse:
+    r = await get_redis()
     return JSONResponse(content={
-        "status": "healthy",
-        "agent": "drug-safety",
-        "version": "1.0.0",
-        "mcp_tools": ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
-        "mcp_endpoint": "/mcp/",
+        "status":        "healthy",
+        "agent":         "drug-safety",
+        "version":       "2.0.0",
+        "redis":         "connected" if r else "disconnected",
+        "mcp_tools":     ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
+        "mcp_endpoint":  "/mcp/",
         "rest_endpoint": "/check-safety",
+        "llm_model":     "gemini-2.5-flash (structured output via .with_structured_output())",
         "external_apis": ["NLM RxNav", "NLM RxNorm", "FDA OpenFDA"],
         "local_databases": ["cross_reactivity_table", "contraindications.json"],
+        "pipeline_phases": [
+            "1. Allergy cross-reactivity (deterministic)",
+            "2. Condition contraindications (deterministic)",
+            "3. RxNav interactions (async API)",
+            "4. FDA warnings (async API, concurrent)",
+            "5. LLM interaction enrichment (structured output)",
+            "6. LLM patient risk profile (structured output)",
+            "7. FHIR MedicationRequest assembly",
+        ],
     })
 
 
 # ── Mount MCP + REST into unified ASGI app ───────────────────────────────────
-# The MCP streamable-HTTP app runs at /mcp/
-# The REST endpoints run at / (root of this app)
 
-from starlette.applications import Starlette
-from starlette.routing import Mount, Route
-
-# Get the MCP ASGI app
 mcp_asgi = mcp.streamable_http_app()
 
-# Build the combined app using Starlette
 combined_app = Starlette(
     routes=[
         Mount("/mcp", app=mcp_asgi),
-        Mount("/", app=rest_app),
+        Mount("/",    app=rest_app),
     ]
 )
 
