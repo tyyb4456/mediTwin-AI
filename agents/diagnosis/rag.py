@@ -1,16 +1,24 @@
 # agents/diagnosis/rag_chain.py
 import os
+import re
+import json
+import hashlib
+import logging
+import time
 from typing import Optional
-
+ 
 import chromadb
 from langchain.tools import tool
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
-
-from shared.models import DiagnosisOutput
+ 
+from shared.models import DiagnosisOutput, DiagnosisItem, NextStep
 from dotenv import load_dotenv
+ 
 load_dotenv()
+ 
+logger = logging.getLogger("meditwin.diagnosis.rag")
 
 
 COLLECTION_NAME = "medical_knowledge"
@@ -35,13 +43,88 @@ PATIENT DATA:
 Return a ranked differential diagnosis based on the above.
 """
 
+# LLM-only prompt used when ChromaDB is unavailable
+FALLBACK_SYSTEM_PROMPT = """You are a clinical decision support system performing differential diagnosis WITHOUT external knowledge retrieval.
+Apply your internal clinical knowledge carefully.
+
+""" + SYSTEM_PROMPT  # just reuse the full SYSTEM_PROMPT directly
+
+
+# ── Simple TTL cache ──────────────────────────────────────────────────────────
+ 
+class _SimpleCache:
+    """
+    In-memory LRU-style cache with TTL.
+    Keyed on SHA-256 of (patient_id + chief_complaint).
+    Prevents re-hitting ChromaDB + Gemini for identical requests during a demo run.
+    """
+    def __init__(self, ttl_seconds: int = 300, max_size: int = 64):
+        self._store: dict[str, tuple[float, DiagnosisOutput]] = {}
+        self._ttl = ttl_seconds
+        self._max = max_size
+ 
+    def _key(self, patient_id: str, chief_complaint: str) -> str:
+        raw = f"{patient_id}|{chief_complaint.strip().lower()}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+ 
+    def get(self, patient_id: str, chief_complaint: str) -> Optional[DiagnosisOutput]:
+        key = self._key(patient_id, chief_complaint)
+        if key in self._store:
+            ts, value = self._store[key]
+            if time.time() - ts < self._ttl:
+                logger.debug(f"Cache HIT for patient={patient_id}")
+                return value
+            del self._store[key]
+        return None
+ 
+    def set(self, patient_id: str, chief_complaint: str, value: DiagnosisOutput):
+        if len(self._store) >= self._max:
+            # evict oldest
+            oldest = min(self._store, key=lambda k: self._store[k][0])
+            del self._store[oldest]
+        key = self._key(patient_id, chief_complaint)
+        self._store[key] = (time.time(), value)
+ 
+ 
+_cache = _SimpleCache(ttl_seconds=300)
+ 
+ 
+# ── ICD-10 repair helpers ─────────────────────────────────────────────────────
+ 
+_ICD10_PATTERN = re.compile(r'^[A-Z]\d{2}(\.\d{1,4})?$')
+ 
+def _repair_icd10(code: str) -> str:
+    """
+    Attempt to fix common LLM ICD-10 mistakes before Pydantic validation.
+      - Remove spaces: 'J 18.9' → 'J18.9'
+      - Fix dot placement: 'J.18.9' → 'J18.9' (rare but happens)
+      - Uppercase: 'j18.9' → 'J18.9'
+    Returns original if repair fails (Pydantic will then raise).
+    """
+    code = code.strip().upper().replace(" ", "")
+    # 'J.18.9' or 'J.18' → remove the first dot
+    if re.match(r'^[A-Z]\.\d', code):
+        code = code[0] + code[2:]
+    return code
+ 
+ 
+def _validate_and_repair_items(items: list[dict]) -> list[dict]:
+    """Repair ICD-10 codes in raw LLM output before Pydantic parsing."""
+    for item in items:
+        if "icd10_code" in item:
+            item["icd10_code"] = _repair_icd10(item["icd10_code"])
+    return items
+ 
 
 class DiagnosisRAG:
 
     def __init__(self):
         self._vectorstore: Optional[Chroma] = None
+        self._llm = None
         self._structured_llm = None
+        self._fallback_llm = None   # LLM-only, no RAG
         self._retrieve_tool = None
+        self._rag_available = False
         self._initialized = False
 
     def initialize(self):
@@ -64,7 +147,7 @@ class DiagnosisRAG:
         print(f"✓ ChromaDB connected — {count} chunks in '{COLLECTION_NAME}'")
 
         # ── key change: use with_structured_output instead of JsonOutputParser ──
-        llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash", temperature=0.2)
+        llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0.2)
         self._structured_llm = llm.with_structured_output(DiagnosisOutput)
 
         # ── new docs pattern: @tool with response_format="content_and_artifact" ──
@@ -81,120 +164,382 @@ class DiagnosisRAG:
             return serialized, docs  # (content for LLM, raw docs as artifact)
 
         self._retrieve_tool = retrieve_clinical_context
+
+        logger.info(f"ChromaDB connected — {count} chunks in '{COLLECTION_NAME}'")
+        self._rag_available = True
+        self._init_llms()
         self._initialized = True
-        print("✓ Diagnosis RAG chain initialized")
+        logger.info("Diagnosis RAG chain initialized (RAG mode)")
+    
+    def initialize_fallback(self):
+        """
+        Initialize LLM-only mode — no ChromaDB dependency.
+        Used when ChromaDB is unavailable. Graceful degradation.
+        """
+        self._rag_available = False
+        self._init_llms()
+        self._initialized = True
+        logger.warning("Diagnosis RAG chain initialized in FALLBACK mode (LLM-only, no RAG context)")
+ 
+    def _init_llms(self):
+        llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0.1)
+        self._llm = llm
+        # structured_output parses JSON and validates against DiagnosisOutput
+        self._structured_llm = llm.with_structured_output(DiagnosisOutput)
+
+    @property
+    def rag_available(self) -> bool:
+        return self._rag_available
 
     def _build_patient_query(self, patient_state: dict, chief_complaint: str) -> str:
-        """Same logic as before — unchanged."""
         demographics = patient_state.get("demographics", {})
         age = demographics.get("age", "unknown")
         gender = demographics.get("gender", "unknown")
-
+ 
         conditions = [c.get("display", "") for c in patient_state.get("active_conditions", [])[:5]] or ["None"]
-        medications = [m.get("drug", "") for m in patient_state.get("medications", [])[:5]] or ["None"]
-        allergies = [
-            f"{a.get('substance', '')} ({a.get('severity', '')})"
-            for a in patient_state.get("allergies", [])[:3]
+        medications = [
+            f"{m.get('drug', '')} {m.get('dose', '')} {m.get('frequency', '')}".strip()
+            for m in patient_state.get("medications", [])[:5]
         ] or ["None"]
-        abnormal_labs = [
-            f"{l.get('display', '')}: {l.get('value', '')} {l.get('unit', '')} [{l.get('flag', '')}]"
+        allergies = [
+            f"{a.get('substance', '')} ({a.get('severity', 'unknown severity')})"
+            for a in patient_state.get("allergies", [])[:5]
+        ] or ["NKDA"]
+ 
+        # Separate abnormal vs normal labs for readability
+        abnormal_labs = []
+        normal_labs = []
+        for lab in patient_state.get("lab_results", []):
+            flag = lab.get("flag", "NORMAL")
+            entry = (
+                f"{lab.get('display', '')}: {lab.get('value', '')} {lab.get('unit', '')} "
+                f"[{flag}]"
+            )
+            if flag in ("HIGH", "LOW", "CRITICAL"):
+                abnormal_labs.append(entry)
+            else:
+                normal_labs.append(entry)
+ 
+        vitals_section = ""
+        vitals_loincs = {"8310-5", "8867-4", "9279-1", "55284-4", "59408-5"}  # temp, HR, RR, BP, SpO2
+        vitals = [
+            f"{l.get('display')}: {l.get('value')} {l.get('unit')}"
             for l in patient_state.get("lab_results", [])
-            if l.get("flag") in ["HIGH", "LOW", "CRITICAL"]
-        ][:8]
-
+            if l.get("loinc") in vitals_loincs
+        ]
+        if vitals:
+            vitals_section = f"\nVitals: {', '.join(vitals)}"
+ 
+        recent_encounters = patient_state.get("recent_encounters", [])
+        encounter_section = ""
+        if recent_encounters:
+            enc = recent_encounters[0]
+            encounter_section = f"\nRecent encounter: {enc.get('type', '')} on {enc.get('date', '')} — {enc.get('reason', '')}"
+ 
         return (
             f"Patient: {age}-year-old {gender}\n"
             f"Chief Complaint: {chief_complaint}\n"
             f"Active Conditions: {', '.join(conditions)}\n"
             f"Current Medications: {', '.join(medications)}\n"
             f"Allergies: {', '.join(allergies)}\n"
-            f"Abnormal Labs: {', '.join(abnormal_labs) if abnormal_labs else 'None'}"
+            f"ABNORMAL Labs: {', '.join(abnormal_labs) if abnormal_labs else 'None'}\n"
+            f"Normal Labs: {', '.join(normal_labs[:4]) if normal_labs else 'None'}"
+            f"{vitals_section}"
+            f"{encounter_section}"
         )
 
-    def _apply_rule_adjustments(self, output: DiagnosisOutput, patient_state: dict) -> DiagnosisOutput:
-        """Deterministic confidence adjustments on top of LLM output. Same logic, now works on Pydantic model."""
-        allergies = {a.get("substance", "").lower() for a in patient_state.get("allergies", [])}
+    # ── Rule-based adjustments ────────────────────────────────────────────────
+ 
+    def _apply_rule_adjustments(
+        self, output: DiagnosisOutput, patient_state: dict
+    ) -> DiagnosisOutput:
+        """
+        Deterministic post-processing on top of LLM output.
+        Rules engine runs AFTER LLM — adds/modifies deterministically.
+        """
+        allergies_lower = {
+            a.get("substance", "").lower()
+            for a in patient_state.get("allergies", [])
+        }
         labs = {l.get("loinc"): l for l in patient_state.get("lab_results", [])}
-
+ 
         wbc_flag = labs.get("26464-8", {}).get("flag", "")
+        wbc_val = labs.get("26464-8", {}).get("value", 0.0)
         crp_flag = labs.get("1988-5", {}).get("flag", "")
-
+        procalcitonin_flag = labs.get("75241-0", {}).get("flag", "")  # PCT
+ 
+        beta_lactam_substances = {"penicillin", "amoxicillin", "ampicillin", "cephalosporin"}
+        has_betalactam_allergy = bool(allergies_lower & beta_lactam_substances)
+ 
+        # Flag sepsis suspicion: WBC > 15 in any form
+        try:
+            if float(wbc_val) >= 15.0:
+                output.high_suspicion_sepsis = True
+        except (TypeError, ValueError):
+            pass
+ 
+        # Flag penicillin allergy
+        if has_betalactam_allergy:
+            output.penicillin_allergy_flagged = True
+ 
+        # Confidence boosts + allergy notes per diagnosis
         for diag in output.differential_diagnosis:
-            if diag.icd10_code.startswith("J1"):
-                if wbc_flag in ["HIGH", "CRITICAL"] and crp_flag in ["HIGH", "CRITICAL"]:
+            code = diag.icd10_code
+ 
+            # Respiratory infections (J10–J22): boost if labs confirm bacterial
+            if code[:2] in ("J1", "J2"):
+                if wbc_flag in ("HIGH", "CRITICAL") and crp_flag in ("HIGH", "CRITICAL"):
                     diag.confidence = round(min(diag.confidence + 0.08, 0.97), 2)
-                if "penicillin" in allergies or "amoxicillin" in allergies:
-                    note = "Penicillin allergy — standard beta-lactam therapy contraindicated"
+                if procalcitonin_flag in ("HIGH", "CRITICAL"):
+                    diag.confidence = round(min(diag.confidence + 0.04, 0.97), 2)
+                if has_betalactam_allergy:
+                    note = "Beta-lactam allergy — standard penicillin-class therapy contraindicated"
                     if note not in diag.against_evidence:
                         diag.against_evidence.append(note)
-
+ 
+            # Isolation flag: TB (A15–A19), active flu (J09–J11)
+            if code[:3] in ("A15", "A16", "A17", "A18", "A19") or code[:3] in ("J09", "J10", "J11"):
+                output.requires_isolation = True
+ 
         # Recompute confidence_level from top diagnosis
-        top_conf = output.differential_diagnosis[0].confidence if output.differential_diagnosis else 0
-        if top_conf >= 0.80:
-            output.confidence_level = "HIGH"
-        elif top_conf >= 0.60:
-            output.confidence_level = "MODERATE"
-        else:
-            output.confidence_level = "LOW"
-
+        if output.differential_diagnosis:
+            top_conf = output.differential_diagnosis[0].confidence
+            if top_conf >= 0.80:
+                output.confidence_level = "HIGH"
+            elif top_conf >= 0.60:
+                output.confidence_level = "MODERATE"
+            else:
+                output.confidence_level = "LOW"
+ 
+        # Strip MEDICATION next steps that propose a beta-lactam for allergic patient
+        if has_betalactam_allergy:
+            cleaned_steps = []
+            removed = []
+            for step in output.recommended_next_steps:
+                drug = (step.drug_name or "").lower()
+                if step.category == "MEDICATION" and any(
+                    sub in drug for sub in ("amoxicillin", "ampicillin", "penicillin",
+                                            "piperacillin", "oxacillin", "cephalexin",
+                                            "cefazolin", "ceftriaxone", "cefuroxime")
+                ):
+                    removed.append(step.drug_name)
+                    logger.warning(
+                        f"Removed contraindicated medication '{step.drug_name}' "
+                        f"(beta-lactam allergy present)"
+                    )
+                else:
+                    cleaned_steps.append(step)
+            output.recommended_next_steps = cleaned_steps
+            if removed:
+                # Add a flag step so downstream knows what was removed
+                output.recommended_next_steps.insert(0, NextStep(
+                    category="MEDICATION",
+                    description=(
+                        f"⚠️  ALLERGY ALERT: {', '.join(removed)} removed from plan — "
+                        f"patient has documented beta-lactam allergy. Use macrolide or "
+                        f"fluoroquinolone alternative."
+                    ),
+                    urgency="stat",
+                    rationale="Automated allergy safety filter",
+                ))
+ 
         return output
-
-    def run(self, patient_state: dict, chief_complaint: str) -> DiagnosisOutput:
-        if not self._initialized:
-            raise RuntimeError("Not initialized. Call initialize() first.")
-
-        patient_query = self._build_patient_query(patient_state, chief_complaint)
-
-        # Retrieve context using the tool directly
-        docs = self._vectorstore.similarity_search(patient_query, k=6)
-        context = "\n\n---\n\n".join(
-            f"Source: {doc.metadata}\nContent: {doc.page_content}"
-            for doc in docs
-        )
-
+    
+    # ── RAG retrieval ─────────────────────────────────────────────────────────
+ 
+    def _retrieve_context(self, query: str, k: int = 6) -> str:
+        """Retrieve and format clinical context from ChromaDB."""
+        try:
+            docs = self._vectorstore.similarity_search(query, k=k)
+            if not docs:
+                return "No relevant clinical guidelines retrieved."
+            return "\n\n---\n\n".join(
+                f"[Source: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content}"
+                for doc in docs
+            )
+        except Exception as e:
+            logger.error(f"ChromaDB retrieval failed: {e}")
+            return "Clinical guideline retrieval failed — using clinical knowledge only."
+ 
+    # ── LLM invocation with JSON fallback ────────────────────────────────────
+ 
+    def _invoke_llm(
+        self, patient_query: str, context: str, system_prompt: str
+    ) -> DiagnosisOutput:
+        """
+        Invoke LLM with structured output. Falls back to raw JSON parse if
+        with_structured_output fails (handles Gemini occasional schema refusal).
+        """
         prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
+            ("system", system_prompt),
             ("human", HUMAN_PROMPT),
         ])
+ 
+        try:
+            chain = prompt | self._structured_llm
+            output: DiagnosisOutput = chain.invoke({
+                "context": context,
+                "patient_data": patient_query,
+            })
+            return output
+        except Exception as e:
+            logger.warning(f"Structured LLM output failed ({e}), attempting raw JSON parse")
+            return self._invoke_llm_raw_json(patient_query, context, system_prompt)
+ 
+    def _invoke_llm_raw_json(
+        self, patient_query: str, context: str, system_prompt: str
+    ) -> DiagnosisOutput:
+        """
+        Fallback: call LLM without structured output, parse JSON manually.
+        Handles cases where Gemini refuses the schema for complex inputs.
+        """
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", HUMAN_PROMPT),
+        ])
+        chain = prompt | self._llm
+        raw = chain.invoke({"context": context, "patient_data": patient_query})
+        text = raw.content if hasattr(raw, "content") else str(raw)
+ 
+        # Strip markdown fences
+        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("```").strip()
+ 
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as je:
+            raise RuntimeError(f"LLM returned non-JSON output: {je}\n---\n{text[:500]}")
+ 
+        # Repair ICD-10 codes before Pydantic validation
+        if "differential_diagnosis" in data:
+            data["differential_diagnosis"] = _validate_and_repair_items(
+                data["differential_diagnosis"]
+            )
+ 
+        # Convert recommended_next_steps to NextStep objects if they're dicts
+        if "recommended_next_steps" in data:
+            steps = []
+            for s in data["recommended_next_steps"]:
+                if isinstance(s, str):
+                    # Old format: plain string → wrap as MEDICATION or INVESTIGATION
+                    steps.append(NextStep(
+                        category="INVESTIGATION",
+                        description=s,
+                        urgency="routine",
+                    ))
+                elif isinstance(s, dict):
+                    steps.append(NextStep(**s))
+            data["recommended_next_steps"] = steps
+ 
+        return DiagnosisOutput(**data)
+    
 
-        # Chain: prompt | structured LLM → DiagnosisOutput Pydantic object directly
-        chain = prompt | self._structured_llm
-        output: DiagnosisOutput = chain.invoke({
-            "context": context,
-            "patient_data": patient_query,
-        })
-
+    # ── Public interface ──────────────────────────────────────────────────────
+ 
+    def run(
+        self,
+        patient_state: dict,
+        chief_complaint: str,
+        request_id: Optional[str] = None,
+    ) -> DiagnosisOutput:
+        """
+        Main entry point. Checks cache first, then runs RAG or fallback.
+        """
+        if not self._initialized:
+            raise RuntimeError("DiagnosisRAG not initialized. Call initialize() or initialize_fallback() first.")
+ 
+        patient_id = patient_state.get("patient_id", "unknown")
+        log_prefix = f"[{request_id}]" if request_id else f"[{patient_id}]"
+ 
+        # Cache check
+        cached = _cache.get(patient_id, chief_complaint)
+        if cached:
+            logger.info(f"{log_prefix} Returning cached diagnosis result")
+            return cached
+ 
+        t0 = time.time()
+        patient_query = self._build_patient_query(patient_state, chief_complaint)
+ 
+        if self._rag_available:
+            logger.info(f"{log_prefix} Running RAG retrieval + Gemini inference")
+            context = self._retrieve_context(patient_query, k=6)
+            system_prompt = SYSTEM_PROMPT
+        else:
+            logger.warning(f"{log_prefix} Running LLM-only fallback (no RAG context)")
+            context = "No clinical guidelines available — apply clinical judgment."
+            system_prompt = FALLBACK_SYSTEM_PROMPT
+ 
+        output = self._invoke_llm(patient_query, context, system_prompt)
         output = self._apply_rule_adjustments(output, patient_state)
-
-        # Sync top_diagnosis/code from rank 1
+ 
+        # Sync top_diagnosis / top_icd10_code from rank-1 item
         if output.differential_diagnosis:
             top = output.differential_diagnosis[0]
             output.top_diagnosis = top.display
             output.top_icd10_code = top.icd10_code
-
+ 
+        elapsed = round(time.time() - t0, 2)
+        logger.info(
+            f"{log_prefix} Diagnosis complete in {elapsed}s — "
+            f"{output.top_diagnosis} ({output.top_icd10_code}) {output.confidence_level}"
+            f"{' [FALLBACK MODE]' if not self._rag_available else ''}"
+        )
+ 
+        _cache.set(patient_id, chief_complaint, output)
         return output
-
+ 
     def build_fhir_conditions(self, output: DiagnosisOutput, patient_id: str) -> list[dict]:
-        """Now takes DiagnosisOutput directly instead of a raw dict."""
+        """
+        Build FHIR Condition resources from diagnosis output.
+ 
+        Verification status is confidence-dependent:
+          ≥ 0.75 → 'provisional'   (high enough confidence to act on)
+          ≥ 0.50 → 'differential'  (working diagnosis, needs confirmation)
+          < 0.50 → 'refuted'       (low confidence, listed for completeness)
+        """
         conditions = []
         for diag in output.differential_diagnosis[:3]:
+            if diag.confidence >= 0.75:
+                verification_code = "provisional"
+            elif diag.confidence >= 0.50:
+                verification_code = "differential"
+            else:
+                verification_code = "refuted"
+ 
             conditions.append({
                 "resourceType": "Condition",
                 "subject": {"reference": f"Patient/{patient_id}"},
-                "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10",
-                                      "code": diag.icd10_code, "display": diag.display}]},
-                "verificationStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
-                                                    "code": "provisional"}]},
-                "clinicalStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
-                                                "code": "active"}]},
-                "note": [{"text": (
-                    f"AI differential (rank {diag.rank}). "
-                    f"Confidence: {diag.confidence:.0%}. "
-                    f"{diag.clinical_reasoning}. "
-                    "Requires physician verification."
-                )}]
+                "code": {
+                    "coding": [{
+                        "system": "http://hl7.org/fhir/sid/icd-10",
+                        "code": diag.icd10_code,
+                        "display": diag.display,
+                    }]
+                },
+                "verificationStatus": {
+                    "coding": [{
+                        "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+                        "code": verification_code,
+                        "display": verification_code.capitalize(),
+                    }]
+                },
+                "clinicalStatus": {
+                    "coding": [{
+                        "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                        "code": "active",
+                    }]
+                },
+                "note": [{
+                    "text": (
+                        f"AI differential rank {diag.rank}. "
+                        f"Confidence: {diag.confidence:.0%}. "
+                        f"{diag.clinical_reasoning}. "
+                        f"Supporting: {'; '.join(diag.supporting_evidence[:3])}. "
+                        "REQUIRES PHYSICIAN VERIFICATION — not for direct clinical use."
+                    )
+                }],
             })
         return conditions
-
-
+ 
+ 
+# Singleton
 diagnosis = DiagnosisRAG()
