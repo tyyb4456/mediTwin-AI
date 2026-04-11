@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir --timeout=300 \
     "uvicorn[standard]" \
     pydantic \
     pydantic-settings \
-    # tensorflow \
+    tensorflow-cpu \
     Pillow \
     numpy \
     python-dotenv
@@ -22,8 +22,7 @@ RUN pip install --no-cache-dir --timeout=300 \
 COPY shared/ /app/shared/
 COPY agents/imaging_triage/ /app/agent/
 
-ENV PYTHONPATH=/app 
-
+ENV PYTHONPATH=/app
 
 WORKDIR /app/agent
 

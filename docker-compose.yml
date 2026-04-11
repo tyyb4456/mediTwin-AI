@@ -325,6 +325,69 @@ services:
       #   retries: 5
       restart: unless-stopped
 
+# ── Agent 10: Tool Agent — ReAct LLM tool-calling agent (port 8010) ──────────
+#
+# Add this service block to your docker-compose.yml under `services:`.
+# Also add 'tool-agent' to the orchestrator's `depends_on` list (optional).
+#
+# Difference from Orchestrator (8000):
+#   Orchestrator:  deterministic graph, fixed node order, all agents always run
+#   Tool Agent:    LLM-driven ReAct loop, selects tools per query, supports /chat
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD THIS BLOCK to your docker-compose.yml under `services:`
+#
+# Agent 10: Tool Agent — Conservative ReAct tool-calling agent (port 8010)
+#
+# Behavior:
+#   Query WITH patient ID  → fetches context, calls only relevant tools
+#   Query WITHOUT patient  → answers from general medical knowledge, no tools
+#
+# This is the ONLY difference from Orchestrator (8000):
+#   Orchestrator: always runs all 8 agents in fixed deterministic order
+#   Tool Agent:   LLM triage — zero to selective tools based on query intent
+# ─────────────────────────────────────────────────────────────────────────────
+
+  tool-agent:
+    build:
+      context: .
+      dockerfile: agents/tool_agent/Dockerfile
+    container_name: meditwin-tool-agent
+    ports:
+      - "8010:8010"
+    environment:
+      - PATIENT_CONTEXT_URL=http://patient-context:8001
+      - DIAGNOSIS_URL=http://diagnosis:8002
+      - LAB_ANALYSIS_URL=http://lab-analysis:8003
+      - DRUG_SAFETY_URL=http://drug-safety:8004
+      - IMAGING_TRIAGE_URL=http://imaging-triage:8005
+      - DIGITAL_TWIN_URL=http://digital-twin:8006
+      - CONSENSUS_URL=http://consensus:8007
+      - EXPLANATION_URL=http://explanation:8009
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      # Shares the same PostgreSQL checkpoint DB as the orchestrator
+      # Thread prefix: "default" or user-supplied session_id
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints
+      - INTERNAL_TOKEN=meditwin-internal
+    depends_on:
+      - patient-context
+      - diagnosis
+      - lab-analysis
+      - drug-safety
+      - imaging-triage
+      - digital-twin
+      - consensus
+      - explanation
+      - postgres-checkpoint
+    networks:
+      - meditwin-network
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+    #   interval: 60s
+    #   timeout: 5s
+    #   retries: 5
+    restart: unless-stopped
+
 networks:
   meditwin-network:
     driver: bridge

@@ -1,20 +1,16 @@
 """
 Imaging Triage Inference Module
-Wraps the trained pneumonia CNN for FastAPI serving.
+Wraps the trained EfficientNetB0 pneumonia model for FastAPI serving.
 
 CRITICAL: Preprocessing pipeline MUST match training exactly.
 Training was done on Kaggle "Chest X-Ray Images (Pneumonia)" dataset:
   - Images resized to 224x224
-  - Pixel values normalized to [0, 1] (divide by 255)
-  - ImageNet mean/std normalization applied
+  - Pixel values kept as RAW [0, 255] — EfficientNetB0 has built-in preprocessing
+  - include_preprocessing=True was set in EfficientNetB0 constructor
   - RGB format (3 channels)
+  - Binary sigmoid output: 0.0 = NORMAL, 1.0 = PNEUMONIA
 
-If your model used different preprocessing (e.g. grayscale, different size),
-update IMAGE_SIZE and NORMALIZE_IMAGENET below accordingly.
-
-Model output: Binary sigmoid
-  - 0.0 = NORMAL
-  - 1.0 = PNEUMONIA
+DO NOT divide by 255 — EfficientNet handles that internally.
 """
 import os
 import io
@@ -28,7 +24,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 
-# TensorFlow import — optional, graceful degradation if not installed
 try:
     import tensorflow as tf
     TF_AVAILABLE = True
@@ -39,21 +34,17 @@ except ImportError:
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-MODEL_PATH = Path(__file__).parent / "models" / "pneumonia_cnn_v1.h5"
+MODEL_PATH = Path(__file__).parent / "models" / "efficientnet_b0.keras"
 
 # Must match training config
 IMAGE_SIZE = (224, 224)
 
-# ImageNet normalization (standard for VGG16/ResNet50 transfer learning)
-# Set NORMALIZE_IMAGENET = False if your model only used /255 normalization
-NORMALIZE_IMAGENET = True
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# EfficientNetB0 with include_preprocessing=True handles its own normalization
+# DO NOT apply manual normalization — raw [0, 255] pixels go straight in
+NORMALIZE_IMAGENET = False   # NOT used — kept for reference only
 
-# Inference threshold
 PNEUMONIA_THRESHOLD = 0.50
 
-# Thread pool for CPU-bound TF inference (keeps event loop unblocked)
 _executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -65,11 +56,6 @@ _model_error: Optional[str] = None
 
 
 def load_model_from_disk() -> bool:
-    """
-    Load the Keras model from disk.
-    Called ONCE at startup — never per-request.
-    Returns True on success, False on failure.
-    """
     global _model, _model_loaded, _model_error
 
     if not TF_AVAILABLE:
@@ -79,20 +65,20 @@ def load_model_from_disk() -> bool:
     if not MODEL_PATH.exists():
         _model_error = (
             f"Model file not found: {MODEL_PATH}. "
-            "Place your trained pneumonia_cnn_v1.h5 in agents/imaging_triage/models/"
+            "Place efficientnet_b0.keras in agents/imaging_triage/models/"
         )
         print(f"⚠️  {_model_error}")
         return False
 
     try:
-        print(f"  Loading CNN model from {MODEL_PATH}...")
+        print(f"  Loading EfficientNetB0 model from {MODEL_PATH}...")
         _model = tf.keras.models.load_model(str(MODEL_PATH))
         _model_loaded = True
 
-        # Warm up — run one dummy inference so first real request isn't slow
+        # Warm up — raw [0,255] dummy input to match inference pipeline
         dummy = np.zeros((1, IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.float32)
         _model.predict(dummy, verbose=0)
-        print(f"  ✓ Model loaded and warmed up: {MODEL_PATH.name}")
+        print(f"  ✓ EfficientNetB0 loaded and warmed up: {MODEL_PATH.name}")
         return True
 
     except Exception as e:
@@ -105,27 +91,24 @@ def load_model_from_disk() -> bool:
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
     """
-    Preprocess a PIL Image for inference.
-    MUST match training preprocessing exactly.
+    Preprocess a PIL Image for EfficientNetB0 inference.
 
-    Returns: float32 array of shape (1, 224, 224, 3)
+    Key difference from standard CNN:
+      - NO division by 255
+      - EfficientNetB0 (include_preprocessing=True) rescales internally
+      - Output dtype: float32, range [0, 255]
+      - Shape: (1, 224, 224, 3)
     """
-    # Convert to RGB — handles grayscale X-rays and RGBA screenshots
+    # Convert to RGB — handles grayscale X-rays and RGBA
     image = image.convert("RGB")
 
     # Resize to training input size
     image = image.resize(IMAGE_SIZE, Image.LANCZOS)
 
-    # Convert to float32 array
+    # Convert to float32 — keep raw pixel range [0, 255]
     arr = np.array(image, dtype=np.float32)
 
-    # Normalize to [0, 1]
-    arr = arr / 255.0
-
-    # Apply ImageNet normalization if model was trained with it
-    if NORMALIZE_IMAGENET:
-        arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-
+    # NO normalization — EfficientNetB0 preprocesses internally
     # Add batch dimension: (224, 224, 3) → (1, 224, 224, 3)
     return np.expand_dims(arr, axis=0)
 
@@ -135,7 +118,6 @@ def decode_base64_image(b64_data: str) -> Image.Image:
     Decode a base64-encoded image string to PIL Image.
     Handles both raw base64 and data URLs (data:image/jpeg;base64,...).
     """
-    # Strip data URL prefix if present
     if "," in b64_data:
         b64_data = b64_data.split(",", 1)[1]
 
@@ -146,12 +128,8 @@ def decode_base64_image(b64_data: str) -> Image.Image:
 # ── Inference ──────────────────────────────────────────────────────────────────
 
 def _run_inference_sync(preprocessed: np.ndarray) -> float:
-    """
-    Synchronous inference — run in thread pool to avoid blocking event loop.
-    Returns raw sigmoid output (0.0 to 1.0).
-    """
+    """Synchronous TF inference — runs in thread pool."""
     prediction = _model.predict(preprocessed, verbose=0)
-    # Flatten to scalar — handles both (1,1) and (1,) output shapes
     return float(np.squeeze(prediction))
 
 
@@ -167,17 +145,9 @@ TRIAGE_LABELS = {1: "IMMEDIATE", 2: "URGENT", 3: "SEMI-URGENT", 4: "ROUTINE"}
 
 def classify_severity(pneumonia_prob: float, patient_age: int) -> dict:
     """
-    Map model confidence → clinical triage priority.
-
-    Priority scale:
-      1 = IMMEDIATE (treat now)
-      2 = URGENT (within 4-6 hours)
-      3 = SEMI-URGENT (within 24 hours)
-      4 = ROUTINE (normal workup)
-
-    Age modifier: patients >65 or <5 get one priority bump.
+    Map EfficientNetB0 confidence → clinical triage priority.
+    EfficientNet is more precise (0.976) so thresholds are reliable.
     """
-    # Base classification from probability
     if pneumonia_prob >= 0.90:
         grade = "SEVERE"
         priority = 1
@@ -195,7 +165,7 @@ def classify_severity(pneumonia_prob: float, patient_age: int) -> dict:
         priority = 4
         urgency = "No significant consolidation detected. Routine clinical assessment."
 
-    # Age-based priority boost (elderly and pediatric patients get bumped up)
+    # Age-based priority boost
     if (patient_age > 65 or patient_age < 5) and priority > 1:
         priority -= 1
         urgency += f" Priority elevated due to patient age ({patient_age}y)."
@@ -213,7 +183,8 @@ def classify_severity(pneumonia_prob: float, patient_age: int) -> dict:
 AI_DISCLAIMER = (
     "AI-generated triage assistance only. Not a substitute for radiologist review. "
     "For clinical decision support use under physician supervision. "
-    "Model trained on Kaggle Chest X-Ray dataset (binary: NORMAL/PNEUMONIA)."
+    "Model: EfficientNetB0 trained on Kaggle Chest X-Ray dataset (binary: NORMAL/PNEUMONIA). "
+    "Test AUC: 0.981 | Precision: 0.976 | Recall: 0.939."
 )
 
 def build_fhir_diagnostic_report(
@@ -226,7 +197,7 @@ def build_fhir_diagnostic_report(
 ) -> dict:
     """Build FHIR R4 DiagnosticReport resource for imaging result."""
     conclusion = (
-        f"AI Triage: {prediction} "
+        f"AI Triage (EfficientNetB0): {prediction} "
         f"(confidence: {confidence:.1%}). "
         f"Priority: {severity['triage_label']}. "
         f"{AI_DISCLAIMER}"
@@ -267,10 +238,17 @@ def build_fhir_diagnostic_report(
                 "url": "http://meditwin.ai/fhir/StructureDefinition/triage-priority",
                 "valueInteger": severity["triage_priority"],
             },
+            {
+                "url": "http://meditwin.ai/fhir/StructureDefinition/model-name",
+                "valueString": "EfficientNetB0",
+            },
+            {
+                "url": "http://meditwin.ai/fhir/StructureDefinition/model-auc",
+                "valueDecimal": 0.981,
+            },
         ],
     }
 
-    # Add ICD-10 conclusion code only for positive findings
     if prediction == "PNEUMONIA":
         report["conclusionCode"] = [
             {
@@ -287,14 +265,10 @@ def build_fhir_diagnostic_report(
     return report
 
 
-# ── Mock inference for when no model is loaded ────────────────────────────────
+# ── Mock inference ─────────────────────────────────────────────────────────────
 
 def mock_inference(patient_context: dict) -> dict:
-    """
-    Returns a realistic-looking mock result when no model is available.
-    Used for development/testing without the actual .h5 file.
-    Clearly labeled as MOCK in all output fields.
-    """
+    """Returns mock result when no model is available."""
     return {
         "model_output": {
             "prediction": "MOCK_NO_MODEL",
@@ -307,7 +281,10 @@ def mock_inference(patient_context: dict) -> dict:
             "grade": "UNKNOWN",
             "triage_priority": 4,
             "triage_label": "ROUTINE",
-            "clinical_urgency": "MOCK — No model loaded. Place pneumonia_cnn_v1.h5 in models/ directory.",
+            "clinical_urgency": (
+                "MOCK — No model loaded. "
+                "Place efficientnet_b0.keras in agents/imaging_triage/models/"
+            ),
         },
         "imaging_findings": {
             "pattern": "N/A — model not loaded",
@@ -317,15 +294,14 @@ def mock_inference(patient_context: dict) -> dict:
         },
         "clinical_interpretation": (
             f"MOCK OUTPUT — Model file not found at {MODEL_PATH}. "
-            "This is placeholder output for development. "
             f"Error: {_model_error}"
         ),
         "confirms_diagnosis": False,
         "diagnosis_code": None,
         "recommended_actions": [
             f"Place trained model at: {MODEL_PATH}",
+            "Run: cp /kaggle/working/saved_models/efficientnet_b0.keras agents/imaging_triage/models/",
             "Restart the imaging triage agent",
-            "Re-submit the X-ray for real inference",
         ],
         "fhir_diagnostic_report": None,
         "model_loaded": False,
