@@ -53,6 +53,9 @@ from agent_callers import (
 
 logger = logging.getLogger("meditwin.graph")
 
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
+
 
 # ── Fallback consensus for when Consensus Agent is down ───────────────────────
 def _fallback_consensus(state: MediTwinState) -> dict:
@@ -371,6 +374,7 @@ async def build_meditwin_graph_with_checkpointer():
         logger.info("✓ MediTwin graph compiled with PostgreSQL checkpointer")
 
         return compiled
+
 def build_meditwin_graph() -> StateGraph:
     """
     Legacy synchronous builder (for backward compatibility).

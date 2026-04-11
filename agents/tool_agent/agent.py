@@ -126,7 +126,7 @@ async def build_tool_agent():
         agent = create_agent(
             model=llm,
             tools=MEDITWIN_TOOLS,
-            prompt=SYSTEM_PROMPT,
+            system_prompt=SYSTEM_PROMPT,
             checkpointer=checkpointer,
         )
 
