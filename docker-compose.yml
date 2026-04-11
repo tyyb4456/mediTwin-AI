@@ -1,14 +1,18 @@
 version: '3.8'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MediTwin AI — Docker Compose
+# MediTwin AI — Docker Compose (Updated with PostgreSQL Checkpointer)
 #
 # All build contexts are set to "." (project root) so Dockerfiles can
 # reference shared/, requirements.txt, and agent code via absolute paths
 # from root. This is the standard monorepo pattern for Docker.
 #
+# New in this version:
+#   - PostgreSQL database for LangGraph checkpointer (short-term memory)
+#   - Enables thread-scoped persistence and conversation continuity
+#
 # Usage:
-#   cp .env.example .env          # fill in OPENAI_API_KEY
+#   cp .env.example .env          # fill in GOOGLE_API_KEY
 #   docker-compose up --build
 #
 # One-time setup (run before first docker-compose up):
@@ -46,6 +50,27 @@ services:
       - CHROMA_SERVER_HTTP_PORT=8000
     networks:
       - meditwin-network
+    restart: unless-stopped
+
+  # PostgreSQL for LangGraph checkpointer (short-term memory)
+  postgres-checkpoint:
+    image: postgres:16-alpine
+    container_name: meditwin-postgres-checkpoint
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=meditwin_checkpoints
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-checkpoint-data:/var/lib/postgresql/data
+    networks:
+      - meditwin-network
+    # healthcheck:
+    #   test: ["CMD-SHELL", "pg_isready -U postgres"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
     restart: unless-stopped
 
 # ── One-time setup: Knowledge Base Ingest ──
@@ -279,6 +304,8 @@ services:
         - CONSENSUS_URL=http://consensus:8007
         - EXPLANATION_URL=http://explanation:8009
         - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+        # PostgreSQL checkpointer connection
+        - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints
       depends_on:
         - patient-context
         - diagnosis
@@ -288,6 +315,7 @@ services:
         - digital-twin
         - consensus
         - explanation
+        - postgres-checkpoint  # NEW: wait for checkpoint DB
       networks:
         - meditwin-network
       # healthcheck:
@@ -303,3 +331,4 @@ networks:
 
 volumes:
   chromadb-data:
+  postgres-checkpoint-data:  # NEW: persist checkpoint data

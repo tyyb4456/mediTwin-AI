@@ -5,10 +5,15 @@ Port: 8000 — the ONLY agent the outside world talks to directly.
 Responsibilities:
   1. Accept patient analysis requests (with or without SHARP headers)
   2. Validate inputs and initialize MediTwinState
-  3. Execute the LangGraph StateGraph (ainvoke)
+  3. Execute the LangGraph StateGraph (ainvoke) with PostgreSQL checkpointer
   4. Return the final structured output
   5. Expose A2A agent card metadata for Prompt Opinion platform
   6. Health check endpoint that reports status of ALL downstream agents
+
+Short-term memory (added 2025):
+  - PostgreSQL checkpointer persists graph state across requests
+  - Each patient_id maps to a thread_id for conversation continuity
+  - Enables resumable workflows and human-in-the-loop patterns
 
 From strategy doc:
   "Build the Orchestrator last — it only makes sense once all agents exist.
@@ -30,7 +35,7 @@ from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from graph import build_meditwin_graph
+from graph import build_meditwin_graph_with_checkpointer
 from agent_callers import (
     PATIENT_CONTEXT_URL, DIAGNOSIS_URL, LAB_ANALYSIS_URL,
     DRUG_SAFETY_URL, IMAGING_TRIAGE_URL, DIGITAL_TWIN_URL,
@@ -44,7 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger("meditwin.orchestrator")
 
 
-# ── Global graph instance ─────────────────────────────────────────────────────
+# ── Global graph instance (with checkpointer) ────────────────────────────────
 _graph = None
 
 
@@ -62,12 +67,21 @@ class MediTwinRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Initialize graph with PostgreSQL checkpointer on startup.
+    Ensures database tables exist and connection is valid.
+    """
     global _graph
     logger.info("MediTwin Orchestrator starting...")
-    _graph = build_meditwin_graph()
-    logger.info("✓ LangGraph StateGraph compiled and ready")
+    
+    # Build graph with PostgreSQL checkpointer
+    _graph = await build_meditwin_graph_with_checkpointer()
+    logger.info("✓ LangGraph StateGraph compiled with PostgreSQL checkpointer")
+    logger.info("✓ Short-term memory enabled (thread-scoped)")
     logger.info("✓ MediTwin Orchestrator ready on port 8000")
+    
     yield
+    
     logger.info("✓ MediTwin Orchestrator shutdown")
 
 
@@ -100,6 +114,11 @@ async def analyze(
       - SHARP headers from Prompt Opinion platform (production)
 
     SHARP headers take priority over request body fields.
+    
+    Memory behavior:
+      - Each patient_id is mapped to a thread_id
+      - Graph state persists across multiple requests for same patient
+      - Enables resumable workflows and incremental analysis
 
     Returns the complete MediTwin output:
       - SOAP note (clinician)
@@ -143,9 +162,17 @@ async def analyze(
         "error_log":          [],
     }
 
-    # Execute graph
+    # Config with thread_id (enables checkpointer persistence)
+    # Use patient_id as thread_id for conversation continuity per patient
+    config = {
+        "configurable": {
+            "thread_id": patient_id,  # Each patient has persistent thread
+        }
+    }
+
+    # Execute graph with checkpointer
     try:
-        final_state = await _graph.ainvoke(initial_state)
+        final_state = await _graph.ainvoke(initial_state, config)
     except Exception as e:
         logger.error(f"Graph execution failed: {e}", exc_info=True)
         raise HTTPException(
@@ -206,6 +233,7 @@ async def analyze(
         # Execution metadata
         "error_log": final_state.get("error_log", []),
         "meditwin_version": "1.0.0",
+        "memory_enabled": True,  # PostgreSQL checkpointer active
     }
 
     return JSONResponse(content=response)
@@ -242,6 +270,8 @@ async def health() -> JSONResponse:
     """
     Health check — polls all 8 downstream agents concurrently.
     Reports which are up/down for demo monitoring.
+    
+    Also includes PostgreSQL checkpointer status.
     """
     results = await asyncio.gather(*[
         _check_agent(name, url)
@@ -251,6 +281,16 @@ async def health() -> JSONResponse:
     agent_health = dict(zip(AGENT_ENDPOINTS.keys(), results))
     healthy_count = sum(1 for v in agent_health.values() if v["status"] == "healthy")
     all_healthy = healthy_count == len(AGENT_ENDPOINTS)
+    
+    # Check checkpointer status
+    checkpointer_status = "unknown"
+    try:
+        if _graph and hasattr(_graph, 'checkpointer'):
+            checkpointer_status = "active"
+        else:
+            checkpointer_status = "not configured"
+    except Exception:
+        checkpointer_status = "error"
 
     return JSONResponse(content={
         "status": "healthy" if all_healthy else "degraded",
@@ -259,6 +299,8 @@ async def health() -> JSONResponse:
         "agents_total": len(AGENT_ENDPOINTS),
         "agents": agent_health,
         "graph_compiled": _graph is not None,
+        "checkpointer": checkpointer_status,
+        "memory_enabled": checkpointer_status == "active",
         "version": "1.0.0",
     })
 
@@ -279,7 +321,8 @@ async def agent_card() -> JSONResponse:
             "Combines 8 specialist AI agents to produce a comprehensive medical assessment: "
             "differential diagnosis, lab interpretation, medical imaging triage (CNN), "
             "drug safety checking (FDA data), digital twin outcome simulation, "
-            "and plain-language patient communication — all FHIR R4 compliant."
+            "and plain-language patient communication — all FHIR R4 compliant. "
+            "Includes short-term memory for conversation continuity."
         ),
         "author": "Tayyab Hussain",
         "tagline": "What is happening? What will happen next? What should we do?",
@@ -306,6 +349,7 @@ async def agent_card() -> JSONResponse:
             "consensus_conflict_detection",
             "fhir_r4_compliant_output",
             "patient_plain_language_explanation",
+            "short_term_memory_persistence",  # NEW: checkpointer capability
         ],
         "agents": [
             {"id": 1, "name": "Patient Context Agent",      "port": 8001, "type": "A2A"},
@@ -321,6 +365,12 @@ async def agent_card() -> JSONResponse:
             "name": "drug-safety-mcp",
             "endpoint": f"{DRUG_SAFETY_URL}/mcp/",
             "tools": ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
+        },
+        "memory": {
+            "type": "short_term",
+            "implementation": "PostgreSQL checkpointer",
+            "scope": "thread_scoped (per patient_id)",
+            "persistence": "database_backed",
         },
     })
 

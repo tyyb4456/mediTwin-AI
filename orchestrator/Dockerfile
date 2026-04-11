@@ -4,6 +4,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
+# Install dependencies including PostgreSQL checkpoint support
 RUN pip install --no-cache-dir --timeout=300 \
     fastapi \
     "uvicorn[standard]" \
@@ -15,6 +16,8 @@ RUN pip install --no-cache-dir --timeout=300 \
     langchain-core \
     langsmith \
     langgraph \
+    langgraph-checkpoint-postgres \
+    "psycopg[binary,pool]" \
     python-dotenv
 
 COPY shared/ /app/shared/

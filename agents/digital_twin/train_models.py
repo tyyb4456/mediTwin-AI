@@ -36,7 +36,7 @@ np.random.seed(42)
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-N_SAMPLES = 2000   # Enough to produce stable-looking models
+N_SAMPLES = 8_000   # at 8% mortality → ~640 positives in train, plenty to learn
 
 
 # ── Feature definitions (must match feature_engineering.py exactly) ────────────
@@ -116,58 +116,54 @@ def generate_synthetic_patients(n: int) -> pd.DataFrame:
 
 
 def generate_labels(df: pd.DataFrame) -> dict:
-    """
-    Generate clinically plausible labels using logistic functions
-    of the features. Not random — driven by known clinical risk factors.
-    """
     n = len(df)
 
-    # ── 30-day readmission ────────────────────────────────────────────────────
-    # Key drivers: age, comorbidities, CKD, CHF, creatinine
+    # ── 30-day readmission ── target ~20%
     readmit_logit = (
-        -3.5
-        + 0.025 * (df["age"] - 65)
-        + 0.4  * df["has_ckd"]
-        + 0.5  * df["has_chf"]
-        + 0.3  * df["has_copd"]
-        + 0.2  * df["has_diabetes"]
-        + 0.15 * df["comorbidity_count"]
-        + 0.2  * (df["creatinine"] - 1.0).clip(0)
-        + 0.1  * df["critical_lab_count"]
-        - 0.1  * (df["albumin"] - 3.5).clip(None, 0)   # low albumin = worse
-        + np.random.normal(0, 0.3, n)
+        -3.3
+        + 0.03  * (df["age"] - 65)
+        + 0.8   * df["has_ckd"]
+        + 1.0   * df["has_chf"]
+        + 0.6   * df["has_copd"]
+        + 0.4   * df["has_diabetes"]
+        + 0.20  * df["comorbidity_count"]
+        + 0.5   * (df["creatinine"] - 1.0).clip(0)
+        + 0.3   * df["critical_lab_count"]
+        - 0.3   * (df["albumin"] - 3.5).clip(None, 0)
+        + 0.4   * df["on_steroid"]           # ← add: steroids → readmission risk
+        + 0.3   * (df["hemoglobin"] < 10).astype(int)  # ← add: anemia → readmission
+        + np.random.normal(0, 0.3, n)   # was 0.4
     )
     readmit_prob = 1 / (1 + np.exp(-readmit_logit))
     y_readmit = (readmit_prob > np.random.uniform(0, 1, n)).astype(int)
 
-    # ── 30-day mortality ──────────────────────────────────────────────────────
-    # Key drivers: age, CHF, creatinine, critical labs, low albumin
+    
+    # ── 30-day mortality ──
     mort_logit = (
-        -5.0
-        + 0.035 * (df["age"] - 65)
-        + 0.6  * df["has_chf"]
-        + 0.4  * df["has_ckd"]
-        + 0.5  * (df["creatinine"] > 2.0).astype(int)
-        + 0.4  * df["critical_lab_count"]
-        + 0.5  * (df["albumin"] < 3.0).astype(int)
-        + 0.3  * (df["wbc"] > 15).astype(int)
-        + np.random.normal(0, 0.3, n)
+        -3.8
+        + 0.05  * (df["age"] - 65)       # was 0.04
+        + 1.0   * df["has_chf"]          # was 0.7
+        + 0.7   * df["has_ckd"]          # was 0.5
+        + 0.9   * (df["creatinine"] > 2.0).astype(int)   # was 0.6
+        + 0.7   * df["critical_lab_count"]               # was 0.5
+        + 0.8   * (df["albumin"] < 3.0).astype(int)      # was 0.6
+        + 0.5   * (df["wbc"] > 15).astype(int)
+        + np.random.normal(0, 0.4, n)    # was 0.6
     )
     mort_prob = 1 / (1 + np.exp(-mort_logit))
     y_mort = (mort_prob > np.random.uniform(0, 1, n)).astype(int)
 
-    # ── Complication ──────────────────────────────────────────────────────────
-    # Key drivers: diabetes, anticoagulant, CKD, steroid, polypharmacy
+    # ── Complication ──
     comp_logit = (
-        -2.5
-        + 0.4  * df["has_diabetes"]
-        + 0.3  * df["on_anticoagulant"]
-        + 0.4  * df["has_ckd"]
-        + 0.3  * df["on_steroid"]
-        + 0.1  * df["med_count"]
-        + 0.2  * df["critical_lab_count"]
-        + 0.02 * (df["age"] - 65)
-        + np.random.normal(0, 0.3, n)
+        -3.4
+        + 0.7   * df["has_diabetes"]     # was 0.5
+        + 0.6   * df["on_anticoagulant"] # was 0.4
+        + 0.7   * df["has_ckd"]          # was 0.5
+        + 0.5   * df["on_steroid"]       # was 0.4
+        + 0.15  * df["med_count"]        # was 0.12
+        + 0.4   * df["critical_lab_count"]
+        + 0.04  * (df["age"] - 65)
+        + np.random.normal(0, 0.4, n)    # was 0.6
     )
     comp_prob = 1 / (1 + np.exp(-comp_logit))
     y_comp = (comp_prob > np.random.uniform(0, 1, n)).astype(int)
@@ -186,18 +182,25 @@ def train_and_save_model(
 ) -> xgb.XGBClassifier:
     """Train a single XGBoost classifier and save it."""
     model = xgb.XGBClassifier(
-        n_estimators=120,
-        max_depth=4,
-        learning_rate=0.08,
+        n_estimators=300,          # was 120
+        max_depth=3,               # was 4 — shallower = less overfit on small data
+        learning_rate=0.05,        # was 0.08 — slower = more stable
         subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=3,
+        colsample_bytree=0.7,
+        min_child_weight=5,        # was 3 — more conservative on rare positives
         scale_pos_weight=(y_train == 0).sum() / (y_train == 1).sum(),
-        eval_metric="logloss",
+        reg_alpha=0.1,             # L1 — add this
+        reg_lambda=1.5,            # L2 — increase this
+        eval_metric="auc",         # was logloss — optimize directly for AUC
+        early_stopping_rounds=20,  # add this — prevents overfit
         random_state=42,
         verbosity=0,
     )
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_test, y_test)],
+        verbose=False
+    )
 
     # Evaluate
     y_prob = model.predict_proba(X_test)[:, 1]

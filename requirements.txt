@@ -16,7 +16,11 @@ langchain-text-splitters
 langchain-community
 langchain-google-genai
 langgraph
+langgraph-checkpoint-postgres
 langsmith
+
+# PostgreSQL for LangGraph checkpointer (short-term memory)
+psycopg[binary,pool]
 
 # Vector database
 chromadb

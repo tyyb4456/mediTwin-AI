@@ -24,12 +24,20 @@ Key design decisions:
   - Conditional imaging: add_conditional_edges routes around imaging if no image
   - safe_call on every agent: no single failure crashes the graph
   - Patient Context failure is the ONLY fatal failure
+  
+Memory strategy (added 2025):
+  - PostgreSQL checkpointer for short-term memory (thread-scoped)
+  - Persists conversation state across multiple requests to same patient
+  - Enables resumability and human-in-the-loop workflows
+  - Database: shares PostgreSQL instance with other MediTwin agents
 """
 import asyncio
 import logging
+import os
 from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from state import MediTwinState
 from agent_callers import (
@@ -316,13 +324,62 @@ async def node_explanation(state: MediTwinState) -> dict:
     return {"final_output": explanation_result, "error_log": []}
 
 
-# ── Graph builder ─────────────────────────────────────────────────────────────
+# ── Graph builder with checkpointer support ───────────────────────────────────
 
+async def build_meditwin_graph_with_checkpointer():
+    """
+    Build and compile the full MediTwin LangGraph StateGraph with PostgreSQL checkpointer.
+    """
+    db_uri = os.getenv(
+        "POSTGRES_CHECKPOINT_URI",
+        "postgresql://postgres:HkSfxPvOGiAMoTOOYqAllPUWrrBvSKvz@metro.proxy.rlwy.net:43255/railway"
+    )
+
+    # ── Correct usage: async context manager, not awaitable ───────────────────
+    async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
+        try:
+            await checkpointer.setup()
+            logger.info("✓ PostgreSQL checkpointer initialized")
+        except Exception as e:
+            logger.warning(f"Checkpointer setup: {e} (tables may already exist)")
+
+        # ── Build graph ────────────────────────────────────────────────────────
+        graph = StateGraph(MediTwinState)
+
+        graph.add_node("patient_context",        node_patient_context)
+        graph.add_node("parallel_diagnosis_lab", node_parallel_diagnosis_lab)
+        graph.add_node("imaging_triage",         node_imaging_triage)
+        graph.add_node("drug_safety",            node_drug_safety)
+        graph.add_node("digital_twin",           node_digital_twin)
+        graph.add_node("consensus",              node_consensus)
+        graph.add_node("explanation",            node_explanation)
+
+        graph.add_edge(START, "patient_context")
+        graph.add_edge("patient_context", "parallel_diagnosis_lab")
+        graph.add_conditional_edges(
+            "parallel_diagnosis_lab",
+            check_imaging_available,
+            {"imaging_triage": "imaging_triage", "drug_safety": "drug_safety"},
+        )
+        graph.add_edge("imaging_triage", "drug_safety")
+        graph.add_edge("drug_safety",    "digital_twin")
+        graph.add_edge("digital_twin",   "consensus")
+        graph.add_edge("consensus",      "explanation")
+        graph.add_edge("explanation",    END)
+
+        compiled = graph.compile(checkpointer=checkpointer)
+        logger.info("✓ MediTwin graph compiled with PostgreSQL checkpointer")
+
+        return compiled
 def build_meditwin_graph() -> StateGraph:
     """
-    Build and compile the full MediTwin LangGraph StateGraph.
-    Returns the compiled graph, ready for ainvoke().
+    Legacy synchronous builder (for backward compatibility).
+    
+    NOTE: This does NOT include checkpointer.
+    Use build_meditwin_graph_with_checkpointer() for production.
     """
+    logger.warning("Using legacy build_meditwin_graph() without checkpointer")
+    
     graph = StateGraph(MediTwinState)
 
     # Add all nodes
