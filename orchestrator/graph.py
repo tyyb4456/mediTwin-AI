@@ -332,7 +332,7 @@ async def build_meditwin_graph_with_checkpointer():
     """
     db_uri = os.getenv(
         "POSTGRES_CHECKPOINT_URI",
-        "postgresql://postgres:HkSfxPvOGiAMoTOOYqAllPUWrrBvSKvz@metro.proxy.rlwy.net:43255/railway"
+        "postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints"
     )
 
     # ── Correct usage: async context manager, not awaitable ───────────────────
