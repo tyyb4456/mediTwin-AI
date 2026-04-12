@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir --timeout=300 \
     "uvicorn[standard]" \
     pydantic \
     pydantic-settings \
-    # tensorflow-cpu \
+    tensorflow-cpu \
     Pillow \
     numpy \
     python-dotenv

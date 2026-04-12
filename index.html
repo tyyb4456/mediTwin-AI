@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MediTwin — Stream Test</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0d0d0f;
+    --surface: #16161a;
+    --surface2: #1e1e24;
+    --border: rgba(255,255,255,0.08);
+    --border2: rgba(255,255,255,0.14);
+    --text: #f0f0f2;
+    --muted: #888;
+    --accent: #7c6af7;
+    --accent2: #a394fa;
+    --green: #2ecc8a;
+    --yellow: #f5c842;
+    --red: #e2534a;
+    --blue: #4a9edd;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; display: flex; flex-direction: column; }
+
+  header { padding: 1.5rem 2rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  .logo { width: 32px; height: 32px; border-radius: 8px; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; color: #fff; flex-shrink: 0; }
+  header h1 { font-size: 16px; font-weight: 600; color: var(--text); }
+  header span { font-size: 12px; color: var(--muted); margin-left: 4px; }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-left: auto; transition: background 0.3s; }
+  .status-dot.live { background: var(--green); box-shadow: 0 0 0 3px rgba(46,204,138,0.2); }
+
+  main { display: grid; grid-template-columns: 340px 1fr; flex: 1; min-height: 0; }
+
+  .panel-left { border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 1.5rem; gap: 1.25rem; overflow-y: auto; }
+  .panel-right { display: flex; flex-direction: column; min-height: 0; }
+
+  label { font-size: 11px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; display: block; margin-bottom: 6px; }
+  input, textarea { width: 100%; background: var(--surface2); border: 1px solid var(--border2); border-radius: 8px; padding: 9px 12px; color: var(--text); font-size: 14px; font-family: inherit; outline: none; transition: border-color 0.2s; }
+  input:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 70px; }
+
+  .btn { width: 100%; padding: 11px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: opacity 0.2s, transform 0.1s; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .btn:hover { opacity: 0.88; }
+  .btn:active { transform: scale(0.98); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.stop { background: var(--surface2); color: var(--red); border: 1px solid rgba(226,83,74,0.3); }
+
+  .pipeline { display: flex; flex-direction: column; gap: 6px; }
+  .step { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); transition: all 0.25s; font-size: 13px; }
+  .step.active { border-color: rgba(124,106,247,0.4); background: rgba(124,106,247,0.08); }
+  .step.done { border-color: rgba(46,204,138,0.3); background: rgba(46,204,138,0.05); }
+  .step.error { border-color: rgba(226,83,74,0.3); background: rgba(226,83,74,0.05); }
+  .step-icon { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; flex-shrink: 0; background: var(--surface2); color: var(--muted); border: 1px solid var(--border2); transition: all 0.25s; }
+  .step.active .step-icon { background: var(--accent); color: #fff; border-color: transparent; animation: pulse 1s ease-in-out infinite; }
+  .step.done .step-icon { background: var(--green); color: #fff; border-color: transparent; }
+  .step.error .step-icon { background: var(--red); color: #fff; border-color: transparent; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity: 0.6; } }
+  .step-info { flex: 1; min-width: 0; }
+  .step-name { font-weight: 500; color: var(--text); font-size: 12px; }
+  .step-msg { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+  .step-time { font-size: 11px; color: var(--muted); font-family: var(--mono); flex-shrink: 0; }
+
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .metric { background: var(--surface2); border-radius: 8px; padding: 10px 12px; }
+  .metric-val { font-size: 20px; font-weight: 600; color: var(--text); font-family: var(--mono); }
+  .metric-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  .stream-area { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .tabs { display: flex; border-bottom: 1px solid var(--border); padding: 0 1.5rem; gap: 0; }
+  .tab { padding: 12px 16px; font-size: 13px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color 0.2s, border-color 0.2s; user-select: none; }
+  .tab.active { color: var(--accent2); border-color: var(--accent); }
+  .tab:hover:not(.active) { color: var(--text); }
+  .tab-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 16px; border-radius: 9px; background: var(--surface2); font-size: 10px; padding: 0 5px; margin-left: 6px; color: var(--muted); }
+  .tab.active .tab-badge { background: rgba(124,106,247,0.2); color: var(--accent2); }
+
+  .tab-content { display: none; flex: 1; overflow-y: auto; padding: 1rem 1.5rem; flex-direction: column; gap: 6px; }
+  .tab-content.active { display: flex; }
+
+  .event { font-size: 12.5px; font-family: var(--mono); line-height: 1.6; padding: 8px 12px; border-radius: 6px; border-left: 2px solid var(--border2); background: var(--surface); animation: fadeIn 0.2s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .event.status  { border-color: var(--accent); }
+  .event.result  { border-color: var(--green); }
+  .event.error   { border-color: var(--red); }
+  .event.complete { border-color: var(--yellow); }
+  .event.llm_token { border-color: var(--blue); padding: 4px 12px; }
+  .event.final   { border-color: var(--yellow); background: rgba(245,200,66,0.05); }
+  .ev-tag { font-size: 10px; font-weight: 600; letter-spacing: 0.07em; padding: 2px 7px; border-radius: 4px; margin-right: 8px; }
+  .ev-tag.status   { background: rgba(124,106,247,0.2); color: var(--accent2); }
+  .ev-tag.result   { background: rgba(46,204,138,0.15); color: var(--green); }
+  .ev-tag.error    { background: rgba(226,83,74,0.15); color: var(--red); }
+  .ev-tag.complete { background: rgba(245,200,66,0.15); color: var(--yellow); }
+  .ev-tag.llm_token { background: rgba(74,158,221,0.15); color: var(--blue); }
+  .ev-tag.final    { background: rgba(245,200,66,0.2); color: var(--yellow); }
+  .ev-node { color: var(--accent2); margin-right: 6px; }
+  .ev-msg { color: var(--text); }
+
+  .token-stream { font-family: var(--mono); font-size: 13px; line-height: 1.8; color: var(--text); padding: 1rem; background: var(--surface); border-radius: 8px; border: 1px solid var(--border); min-height: 80px; word-break: break-word; }
+  .cursor { display: inline-block; width: 8px; height: 14px; background: var(--accent); animation: blink 0.8s step-end infinite; vertical-align: text-bottom; margin-left: 2px; border-radius: 1px; }
+  @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0;} }
+
+  .result-card { background: var(--surface); border: 1px solid var(--border2); border-radius: 10px; overflow: hidden; }
+  .rc-header { padding: 10px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 500; color: var(--muted); }
+  .rc-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .rc-body { padding: 12px 14px; font-size: 13px; font-family: var(--mono); white-space: pre-wrap; word-break: break-word; color: var(--text); max-height: 360px; overflow-y: auto; }
+
+  .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); gap: 10px; font-size: 13px; }
+  .empty-icon { font-size: 32px; opacity: 0.4; }
+
+  .progress-bar-wrap { background: var(--surface2); border-radius: 4px; height: 4px; overflow: hidden; margin-top: 4px; }
+  .progress-bar { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.4s ease; width: 0%; }
+
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">MT</div>
+  <h1>MediTwin <span>Stream Test</span></h1>
+  <div class="status-dot" id="statusDot"></div>
+</header>
+
+<main>
+  <div class="panel-left">
+    <div>
+      <label>Orchestrator URL</label>
+      <input type="text" id="baseUrl" value="http://localhost:8000" />
+    </div>
+    <div>
+      <label>Patient ID</label>
+      <input type="text" id="patientId" value="example" />
+    </div>
+    <div>
+      <label>Chief Complaint</label>
+      <textarea id="chiefComplaint">fever and cough</textarea>
+    </div>
+    <div>
+      <label>FHIR Base URL</label>
+      <input type="text" id="fhirUrl" value="https://hapi.fhir.org/baseR4" />
+    </div>
+
+    <button class="btn" id="runBtn" onclick="startStream()">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M3 2.5l10 5.5-10 5.5z"/></svg>
+      Run Analysis
+    </button>
+    <button class="btn stop" id="stopBtn" onclick="stopStream()" style="display:none">
+      Stop
+    </button>
+
+    <div>
+      <label style="margin-bottom:10px">Pipeline</label>
+      <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="pipeline" id="pipeline" style="margin-top:10px">
+        <div class="step" id="step-patient_context">
+          <div class="step-icon">1</div>
+          <div class="step-info"><div class="step-name">Patient Context</div><div class="step-msg" id="msg-patient_context">waiting...</div></div>
+          <div class="step-time" id="t-patient_context"></div>
+        </div>
+        <div class="step" id="step-parallel_diagnosis_lab">
+          <div class="step-icon">2</div>
+          <div class="step-info"><div class="step-name">Diagnosis + Lab</div><div class="step-msg" id="msg-parallel_diagnosis_lab">waiting...</div></div>
+          <div class="step-time" id="t-parallel_diagnosis_lab"></div>
+        </div>
+        <div class="step" id="step-drug_safety">
+          <div class="step-icon">4</div>
+          <div class="step-info"><div class="step-name">Drug Safety</div><div class="step-msg" id="msg-drug_safety">waiting...</div></div>
+          <div class="step-time" id="t-drug_safety"></div>
+        </div>
+        <div class="step" id="step-digital_twin">
+          <div class="step-icon">5</div>
+          <div class="step-info"><div class="step-name">Digital Twin</div><div class="step-msg" id="msg-digital_twin">waiting...</div></div>
+          <div class="step-time" id="t-digital_twin"></div>
+        </div>
+        <div class="step" id="step-consensus">
+          <div class="step-icon">6</div>
+          <div class="step-info"><div class="step-name">Consensus</div><div class="step-msg" id="msg-consensus">waiting...</div></div>
+          <div class="step-time" id="t-consensus"></div>
+        </div>
+        <div class="step" id="step-explanation">
+          <div class="step-icon">7</div>
+          <div class="step-info"><div class="step-name">Explanation</div><div class="step-msg" id="msg-explanation">waiting...</div></div>
+          <div class="step-time" id="t-explanation"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="metric-val" id="metricEvents">0</div><div class="metric-lbl">events</div></div>
+      <div class="metric"><div class="metric-val" id="metricTokens">0</div><div class="metric-lbl">llm tokens</div></div>
+      <div class="metric"><div class="metric-val" id="metricTime">0.0s</div><div class="metric-lbl">elapsed</div></div>
+      <div class="metric"><div class="metric-val" id="metricConfidence">—</div><div class="metric-lbl">confidence</div></div>
+    </div>
+  </div>
+
+  <div class="panel-right">
+    <div class="stream-area">
+      <div class="tabs">
+        <div class="tab active" onclick="switchTab('events')">Events <span class="tab-badge" id="badge-events">0</span></div>
+        <div class="tab" onclick="switchTab('tokens')">LLM Tokens <span class="tab-badge" id="badge-tokens">0</span></div>
+        <div class="tab" onclick="switchTab('results')">Agent Results <span class="tab-badge" id="badge-results">0</span></div>
+        <div class="tab" onclick="switchTab('final')">Final Output</div>
+        <div class="tab" onclick="switchTab('raw')">Raw SSE</div>
+      </div>
+
+      <div class="tab-content active" id="tab-events">
+        <div class="empty-state" id="empty-events">
+          <div class="empty-icon">⚡</div>
+          <div>Stream events will appear here in real time</div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-tokens">
+        <div class="empty-state" id="empty-tokens">
+          <div class="empty-icon">✦</div>
+          <div>LLM token stream will appear here</div>
+        </div>
+        <div class="token-stream" id="tokenStream" style="display:none"></div>
+      </div>
+
+      <div class="tab-content" id="tab-results">
+        <div class="empty-state" id="empty-results">
+          <div class="empty-icon">◈</div>
+          <div>Agent result summaries will appear here</div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-final">
+        <div class="empty-state" id="empty-final">
+          <div class="empty-icon">◎</div>
+          <div>Final output will appear when analysis is complete</div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-raw">
+        <div class="empty-state" id="empty-raw">
+          <div class="empty-icon">≡</div>
+          <div>Raw SSE lines will appear here</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+let controller = null;
+let startTime = null;
+let timerInterval = null;
+let eventCount = 0;
+let tokenCount = 0;
+let resultCount = 0;
+let rawCount = 0;
+let tokenBuffer = '';
+let stepTimers = {};
+let activeController = null;
+
+const NODE_ALIASES = {
+  diagnosis: 'parallel_diagnosis_lab',
+  lab_analysis: 'parallel_diagnosis_lab',
+  imaging_triage: 'imaging_triage',
+};
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const names = ['events','tokens','results','final','raw'];
+    t.classList.toggle('active', names[i] === name);
+  });
+  document.querySelectorAll('.tab-content').forEach(tc => {
+    tc.classList.toggle('active', tc.id === 'tab-' + name);
+  });
+}
+
+function setStepActive(node) {
+  const el = document.getElementById('step-' + node);
+  if (!el) return;
+  if (!el.classList.contains('done') && !el.classList.contains('error')) {
+    el.classList.add('active');
+    stepTimers[node] = Date.now();
+  }
+}
+
+function setStepDone(node, msg, isError) {
+  const el = document.getElementById('step-' + node);
+  if (!el) return;
+  el.classList.remove('active');
+  el.classList.add(isError ? 'error' : 'done');
+  const msgEl = document.getElementById('msg-' + node);
+  if (msgEl && msg) msgEl.textContent = msg.slice(0,60);
+  const tEl = document.getElementById('t-' + node);
+  if (tEl && stepTimers[node]) {
+    const elapsed = ((Date.now() - stepTimers[node]) / 1000).toFixed(1);
+    tEl.textContent = elapsed + 's';
+  }
+  const icon = el.querySelector('.step-icon');
+  if (icon) icon.textContent = isError ? '✕' : '✓';
+}
+
+function updateProgress(step, total) {
+  const pct = total > 0 ? Math.round((step / total) * 100) : 0;
+  document.getElementById('progressBar').style.width = pct + '%';
+}
+
+function appendEvent(type, node, message, raw) {
+  const emptyEl = document.getElementById('empty-events');
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const div = document.createElement('div');
+  div.className = 'event ' + type;
+  const tag = `<span class="ev-tag ${type}">${type.toUpperCase()}</span>`;
+  const nodeStr = node ? `<span class="ev-node">[${node}]</span>` : '';
+  const msg = `<span class="ev-msg">${escHtml(message || '')}</span>`;
+  div.innerHTML = tag + nodeStr + msg;
+
+  const container = document.getElementById('tab-events');
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+
+  eventCount++;
+  document.getElementById('metricEvents').textContent = eventCount;
+  document.getElementById('badge-events').textContent = eventCount;
+}
+
+function appendToken(token) {
+  const emptyEl = document.getElementById('empty-tokens');
+  if (emptyEl) emptyEl.style.display = 'none';
+  const ts = document.getElementById('tokenStream');
+  ts.style.display = 'block';
+
+  let cursor = ts.querySelector('.cursor');
+  if (cursor) cursor.remove();
+
+  tokenBuffer += escHtml(token);
+  ts.innerHTML = tokenBuffer + '<span class="cursor"></span>';
+  ts.scrollTop = ts.scrollHeight;
+
+  tokenCount++;
+  document.getElementById('metricTokens').textContent = tokenCount;
+  document.getElementById('badge-tokens').textContent = tokenCount;
+}
+
+function appendResult(node, summary) {
+  const emptyEl = document.getElementById('empty-results');
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const colors = {
+    patient_context: '#7c6af7',
+    diagnosis: '#2ecc8a',
+    lab_analysis: '#4a9edd',
+    drug_safety: '#f5c842',
+    digital_twin: '#a394fa',
+    consensus: '#2ecc8a',
+    explanation: '#f5c842',
+  };
+  const color = colors[node] || '#888';
+
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.innerHTML = `
+    <div class="rc-header">
+      <div class="rc-dot" style="background:${color}"></div>
+      ${escHtml(node)}
+    </div>
+    <div class="rc-body">${escHtml(JSON.stringify(summary, null, 2))}</div>
+  `;
+
+  const container = document.getElementById('tab-results');
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
+
+  resultCount++;
+  document.getElementById('badge-results').textContent = resultCount;
+}
+
+function appendRaw(line) {
+  const emptyEl = document.getElementById('empty-raw');
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const div = document.createElement('div');
+  div.style.cssText = `font-family:var(--mono);font-size:11.5px;color:#666;padding:2px 0;border-bottom:1px solid var(--border);`;
+  div.textContent = line.slice(0, 300) + (line.length > 300 ? '…' : '');
+  const container = document.getElementById('tab-raw');
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+
+  rawCount++;
+}
+
+function showFinal(data) {
+  const emptyEl = document.getElementById('empty-final');
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const container = document.getElementById('tab-final');
+
+  const soap = data?.clinician_output?.soap_note;
+  if (soap) {
+    const soapCard = document.createElement('div');
+    soapCard.className = 'result-card';
+    soapCard.innerHTML = `
+      <div class="rc-header"><div class="rc-dot" style="background:#7c6af7"></div>SOAP Note</div>
+      <div class="rc-body">${escHtml(
+        'S: ' + (soap.subjective||'') + '\n\n' +
+        'O: ' + (soap.objective||'') + '\n\n' +
+        'A: ' + (soap.assessment||'') + '\n\n' +
+        'P:\n' + (soap.plan||[]).map((p,i) => `  ${i+1}. ${p}`).join('\n')
+      )}</div>`;
+    container.appendChild(soapCard);
+  }
+
+  const patient = data?.patient_output;
+  if (patient) {
+    const pCard = document.createElement('div');
+    pCard.className = 'result-card';
+    pCard.innerHTML = `
+      <div class="rc-header"><div class="rc-dot" style="background:#2ecc8a"></div>Patient Explanation (Grade ${data?.reading_level_check?.grade_level?.toFixed(1) || '?'})</div>
+      <div class="rc-body">${escHtml(
+        (patient.condition_explanation||'') + '\n\n' +
+        (patient.why_this_happened||'') + '\n\n' +
+        (patient.what_happens_next||'')
+      )}</div>`;
+    container.appendChild(pCard);
+  }
+
+  const fullCard = document.createElement('div');
+  fullCard.className = 'result-card';
+  fullCard.innerHTML = `
+    <div class="rc-header"><div class="rc-dot" style="background:#f5c842"></div>Full JSON</div>
+    <div class="rc-body">${escHtml(JSON.stringify(data, null, 2))}</div>`;
+  container.appendChild(fullCard);
+
+  const conf = data?.consensus?.aggregate_confidence;
+  if (conf !== undefined) {
+    document.getElementById('metricConfidence').textContent = Math.round(conf * 100) + '%';
+  }
+
+  switchTab('final');
+}
+
+function escHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function startStream() {
+  const baseUrl = document.getElementById('baseUrl').value.trim();
+  const patientId = document.getElementById('patientId').value.trim();
+  const chiefComplaint = document.getElementById('chiefComplaint').value.trim();
+  const fhirUrl = document.getElementById('fhirUrl').value.trim();
+
+  if (!patientId || !chiefComplaint) { alert('Patient ID and chief complaint are required.'); return; }
+
+  resetUI();
+
+  document.getElementById('runBtn').style.display = 'none';
+  document.getElementById('stopBtn').style.display = 'flex';
+  document.getElementById('statusDot').classList.add('live');
+
+  startTime = Date.now();
+  timerInterval = setInterval(() => {
+    document.getElementById('metricTime').textContent = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
+  }, 100);
+
+  controller = new AbortController();
+
+  try {
+    const res = await fetch(baseUrl + '/analyze/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patient_id: patientId, chief_complaint: chiefComplaint, fhir_base_url: fhirUrl, image_data: '', sharp_token: '' }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      appendEvent('error', 'orchestrator', `HTTP ${res.status}: ${await res.text()}`);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        appendRaw(trimmed);
+
+        if (trimmed === 'data: [DONE]') {
+          appendEvent('complete', 'orchestrator', 'Stream complete — [DONE] received');
+          onStreamDone();
+          return;
+        }
+
+        if (!trimmed.startsWith('data: ')) continue;
+        const jsonStr = trimmed.slice(6);
+        let ev;
+        try { ev = JSON.parse(jsonStr); } catch { continue; }
+
+        handleEvent(ev);
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      appendEvent('error', 'orchestrator', 'Fetch error: ' + err.message);
+    }
+  } finally {
+    onStreamDone();
+  }
+}
+
+function handleEvent(ev) {
+  const type = ev.type;
+  const node = ev.node || '';
+
+  if (type === 'status') {
+    const realNode = NODE_ALIASES[node] || node;
+    setStepActive(realNode);
+    if (ev.step) updateProgress(ev.step - 1, ev.total_steps || 7);
+    const msg = ev.message || '';
+    const msgEl = document.getElementById('msg-' + realNode);
+    if (msgEl) msgEl.textContent = msg.slice(0,60);
+    appendEvent('status', node, msg);
+  }
+
+  else if (type === 'result') {
+    const realNode = NODE_ALIASES[node] || node;
+    setStepDone(realNode, ev.message, false);
+    if (ev.step) updateProgress(ev.step, ev.total_steps || 7);
+    appendEvent('result', node, ev.message || '');
+    if (ev.summary) appendResult(node, ev.summary);
+  }
+
+  else if (type === 'error') {
+    const realNode = NODE_ALIASES[node] || node;
+    setStepDone(realNode, ev.message, true);
+    appendEvent('error', node, ev.message || '');
+  }
+
+  else if (type === 'complete') {
+    const realNode = NODE_ALIASES[node] || node;
+    setStepDone(realNode, ev.message, false);
+    updateProgress(7, 7);
+    appendEvent('complete', node, ev.message || '');
+    if (ev.summary) appendResult(node, ev.summary);
+  }
+
+  else if (type === 'llm_token') {
+    appendToken(ev.token || '');
+    appendEvent('llm_token', node, ev.token || '');
+  }
+
+  else if (type === 'final') {
+    appendEvent('final', 'orchestrator', 'Full analysis result received');
+    if (ev.data) showFinal(ev.data);
+  }
+
+  else if (type === 'fatal_error') {
+    appendEvent('error', 'orchestrator', ev.message || 'Fatal error');
+  }
+}
+
+function onStreamDone() {
+  clearInterval(timerInterval);
+  document.getElementById('runBtn').style.display = 'flex';
+  document.getElementById('stopBtn').style.display = 'none';
+  document.getElementById('statusDot').classList.remove('live');
+  updateProgress(7, 7);
+  const cursor = document.querySelector('.cursor');
+  if (cursor) cursor.remove();
+}
+
+function stopStream() {
+  if (controller) { controller.abort(); controller = null; }
+  onStreamDone();
+}
+
+function resetUI() {
+  eventCount = 0; tokenCount = 0; resultCount = 0; rawCount = 0;
+  tokenBuffer = ''; stepTimers = {};
+
+  document.getElementById('metricEvents').textContent = '0';
+  document.getElementById('metricTokens').textContent = '0';
+  document.getElementById('metricTime').textContent = '0.0s';
+  document.getElementById('metricConfidence').textContent = '—';
+  document.getElementById('badge-events').textContent = '0';
+  document.getElementById('badge-tokens').textContent = '0';
+  document.getElementById('badge-results').textContent = '0';
+  document.getElementById('progressBar').style.width = '0%';
+
+  ['patient_context','parallel_diagnosis_lab','drug_safety','digital_twin','consensus','explanation'].forEach(n => {
+    const el = document.getElementById('step-' + n);
+    if (el) { el.classList.remove('active','done','error'); }
+    const msg = document.getElementById('msg-' + n);
+    if (msg) msg.textContent = 'waiting...';
+    const t = document.getElementById('t-' + n);
+    if (t) t.textContent = '';
+    const icon = el?.querySelector('.step-icon');
+    if (icon) icon.textContent = el?.id?.replace('step-','')?.includes('_context') ? '1' : icon.textContent;
+  });
+
+  const stepNums = { patient_context:'1', parallel_diagnosis_lab:'2', drug_safety:'4', digital_twin:'5', consensus:'6', explanation:'7' };
+  Object.entries(stepNums).forEach(([k,v]) => {
+    const el = document.getElementById('step-' + k);
+    if (el) el.querySelector('.step-icon').textContent = v;
+  });
+
+  ['events','raw'].forEach(name => {
+    const el = document.getElementById('tab-' + name);
+    Array.from(el.children).forEach(c => { if (!c.id?.startsWith('empty')) c.remove(); });
+    const empty = document.getElementById('empty-' + name);
+    if (empty) empty.style.display = '';
+  });
+
+  const ts = document.getElementById('tokenStream');
+  ts.style.display = 'none'; ts.innerHTML = '';
+  document.getElementById('empty-tokens').style.display = '';
+
+  const resultsTab = document.getElementById('tab-results');
+  Array.from(resultsTab.children).forEach(c => { if (!c.id?.startsWith('empty')) c.remove(); });
+  document.getElementById('empty-results').style.display = '';
+
+  const finalTab = document.getElementById('tab-final');
+  Array.from(finalTab.children).forEach(c => { if (!c.id?.startsWith('empty')) c.remove(); });
+  document.getElementById('empty-final').style.display = '';
+
+  switchTab('events');
+}
+</script>
+</body>
+</html>

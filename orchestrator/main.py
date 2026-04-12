@@ -1,36 +1,33 @@
 """
-Agent 9: MediTwin Orchestrator
-Port: 8000 — the ONLY agent the outside world talks to directly.
+Agent 9: MediTwin Orchestrator — with Streaming Support
+Port: 8000
 
-Responsibilities:
-  1. Accept patient analysis requests (with or without SHARP headers)
-  2. Validate inputs and initialize MediTwinState
-  3. Execute the LangGraph StateGraph (ainvoke) with PostgreSQL checkpointer
-  4. Return the final structured output
-  5. Expose A2A agent card metadata for Prompt Opinion platform
-  6. Health check endpoint that reports status of ALL downstream agents
+New endpoints:
+  POST /analyze         — original JSON response (unchanged)
+  POST /analyze/stream  — Server-Sent Events (SSE) real-time stream
 
-Short-term memory (added 2025):
-  - PostgreSQL checkpointer persists graph state across requests
-  - Each patient_id maps to a thread_id for conversation continuity
-  - Enables resumable workflows and human-in-the-loop patterns
-
-From strategy doc:
-  "Build the Orchestrator last — it only makes sense once all agents exist.
-   Building it first leads to building an integration layer against nothing."
+SSE stream emits:
+  data: {"type": "status",   "node": "...", "message": "..."}   ← node started
+  data: {"type": "result",   "node": "...", "summary": {...}}    ← node finished with data
+  data: {"type": "error",    "node": "...", "message": "..."}   ← node failed
+  data: {"type": "complete", "node": "...", "summary": {...}}    ← final node done
+  data: {"type": "llm_token","node": "...", "token": "..."}      ← LLM token (if streamed)
+  data: {"type": "final",    "data": {...}}                       ← complete JSON result
+  data: [DONE]                                                    ← stream end
 """
 import os
 import sys
 import time
+import json
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -48,90 +45,135 @@ logging.basicConfig(
 )
 logger = logging.getLogger("meditwin.orchestrator")
 
-
-# ── Global graph instance (with checkpointer) ────────────────────────────────
 _graph = None
 
 
-# ── Request / Response models ──────────────────────────────────────────────────
-
+# ── Request models ─────────────────────────────────────────────────────────────
 class MediTwinRequest(BaseModel):
     patient_id: str
     chief_complaint: str
     fhir_base_url: Optional[str] = "https://hapi.fhir.org/baseR4"
-    image_data: Optional[str] = None      # base64 chest X-ray (optional)
-    sharp_token: Optional[str] = None     # SHARP auth token (optional direct field)
+    image_data: Optional[str] = None
+    sharp_token: Optional[str] = None
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
+# ── Lifespan ───────────────────────────────────────────────────────────────────
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Initialize graph with PostgreSQL checkpointer on startup.
-    Ensures database tables exist and connection is valid.
-    """
-    global _graph
-    logger.info("MediTwin Orchestrator starting...")
-    
-    # Build graph with PostgreSQL checkpointer
-    _graph = await build_meditwin_graph_with_checkpointer()
-    logger.info("✓ LangGraph StateGraph compiled with PostgreSQL checkpointer")
-    logger.info("✓ Short-term memory enabled (thread-scoped)")
-    logger.info("✓ MediTwin Orchestrator ready on port 8000")
-    
-    yield
-    
-    logger.info("✓ MediTwin Orchestrator shutdown")
+    db_uri = os.getenv(
+        "POSTGRES_CHECKPOINT_URI",
+        "postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints"
+    )
+
+    async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
+        global _graph
+        logger.info("MediTwin Orchestrator starting...")
+        _graph = await build_meditwin_graph_with_checkpointer(checkpointer)
+        logger.info("✓ LangGraph StateGraph compiled with PostgreSQL checkpointer + streaming")
+        logger.info("✓ MediTwin Orchestrator ready on port 8000")
+        yield
+        logger.info("✓ MediTwin Orchestrator shutdown")
 
 
 app = FastAPI(
     title="MediTwin AI Orchestrator",
     description=(
-        "Multi-agent clinical decision support system. "
-        "Combines diagnosis, lab analysis, imaging, drug safety, "
-        "digital twin simulation, and explanation into a single clinical assessment."
+        "Multi-agent clinical decision support system with real-time streaming. "
+        "Use POST /analyze for full JSON response or POST /analyze/stream for SSE."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
+from fastapi.middleware.cors import CORSMiddleware
 
-# ── Main analysis endpoint ─────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+
+# ── Shared: build initial state ────────────────────────────────────────────────
+def _build_initial_state(
+    patient_id: str,
+    chief_complaint: str,
+    fhir_base_url: str,
+    sharp_token: str,
+    image_data: Optional[str],
+) -> dict:
+    return {
+        "patient_id":          patient_id,
+        "chief_complaint":     chief_complaint,
+        "fhir_base_url":       fhir_base_url,
+        "sharp_token":         sharp_token,
+        "image_data":          image_data,
+        "imaging_available":   bool(image_data),
+        "patient_state":       None,
+        "diagnosis_output":    None,
+        "lab_output":          None,
+        "drug_safety_output":  None,
+        "imaging_output":      None,
+        "digital_twin_output": None,
+        "consensus_output":    None,
+        "final_output":        None,
+        "human_review_required": False,
+        "error_log":           [],
+    }
+
+
+def _build_final_response(final_state: dict, patient_id: str, elapsed: float, has_image: bool) -> dict:
+    final_output = final_state.get("final_output") or {}
+    return {
+        "patient_id":        patient_id,
+        "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds":   elapsed,
+        "imaging_performed": has_image,
+
+        "clinician_output":    final_output.get("clinician_output"),
+        "patient_output":      final_output.get("patient_output"),
+        "risk_attribution":    final_output.get("risk_attribution"),
+        "fhir_bundle":         final_output.get("fhir_bundle"),
+        "reading_level_check": final_output.get("reading_level_check"),
+
+        "consensus": {
+            "status":               final_state.get("consensus_output", {}).get("consensus_status"),
+            "aggregate_confidence": final_state.get("consensus_output", {}).get("aggregate_confidence"),
+            "human_review_required": final_state.get("human_review_required", False),
+            "conflict_count":       final_state.get("consensus_output", {}).get("conflict_count", 0),
+            "summary":              final_state.get("consensus_output", {}).get("consensus_summary"),
+        },
+
+        "agent_outputs": {
+            "diagnosis":    final_state.get("diagnosis_output"),
+            "lab":          final_state.get("lab_output"),
+            "imaging":      final_state.get("imaging_output"),
+            "drug_safety":  final_state.get("drug_safety_output"),
+            "digital_twin": final_state.get("digital_twin_output"),
+        },
+
+        "error_log":       final_state.get("error_log", []),
+        "meditwin_version": "1.1.0",
+        "memory_enabled":  True,
+    }
+
+
+# ── POST /analyze — original JSON endpoint (unchanged behavior) ────────────────
 @app.post("/analyze")
 async def analyze(
     request: MediTwinRequest,
-    x_sharp_patient_id: Optional[str] = Header(None),
-    x_sharp_fhir_token: Optional[str] = Header(None),
+    x_sharp_patient_id:   Optional[str] = Header(None),
+    x_sharp_fhir_token:   Optional[str] = Header(None),
     x_sharp_fhir_base_url: Optional[str] = Header(None),
 ) -> JSONResponse:
-    """
-    Main MediTwin analysis endpoint.
-
-    Accepts:
-      - Direct request body (development / testing)
-      - SHARP headers from Prompt Opinion platform (production)
-
-    SHARP headers take priority over request body fields.
-    
-    Memory behavior:
-      - Each patient_id is mapped to a thread_id
-      - Graph state persists across multiple requests for same patient
-      - Enables resumable workflows and incremental analysis
-
-    Returns the complete MediTwin output:
-      - SOAP note (clinician)
-      - Patient explanation (plain language)
-      - Risk attribution (SHAP-style)
-      - FHIR R4 Bundle
-      - Consensus status + confidence
-    """
     start_time = time.time()
 
-    # Resolve patient ID and FHIR config — SHARP headers take priority
-    patient_id    = x_sharp_patient_id   or request.patient_id
-    sharp_token   = x_sharp_fhir_token   or request.sharp_token or ""
+    patient_id    = x_sharp_patient_id    or request.patient_id
+    sharp_token   = x_sharp_fhir_token    or request.sharp_token or ""
     fhir_base_url = x_sharp_fhir_base_url or request.fhir_base_url or "https://hapi.fhir.org/baseR4"
 
     if not patient_id:
@@ -139,52 +181,22 @@ async def analyze(
     if not request.chief_complaint:
         raise HTTPException(status_code=400, detail="chief_complaint is required")
 
-    logger.info(f"Analysis request: patient={patient_id}, "
-                f"imaging={'yes' if request.image_data else 'no'}")
+    logger.info(f"Analysis request: patient={patient_id}, imaging={'yes' if request.image_data else 'no'}")
 
-    # Build initial state
-    initial_state = {
-        "patient_id":         patient_id,
-        "chief_complaint":    request.chief_complaint,
-        "fhir_base_url":      fhir_base_url,
-        "sharp_token":        sharp_token,
-        "image_data":         request.image_data,
-        "imaging_available":  bool(request.image_data),
-        "patient_state":      None,
-        "diagnosis_output":   None,
-        "lab_output":         None,
-        "drug_safety_output": None,
-        "imaging_output":     None,
-        "digital_twin_output": None,
-        "consensus_output":   None,
-        "final_output":       None,
-        "human_review_required": False,
-        "error_log":          [],
-    }
+    initial_state = _build_initial_state(
+        patient_id, request.chief_complaint, fhir_base_url, sharp_token, request.image_data
+    )
+    config = {"configurable": {"thread_id": patient_id}}
 
-    # Config with thread_id (enables checkpointer persistence)
-    # Use patient_id as thread_id for conversation continuity per patient
-    config = {
-        "configurable": {
-            "thread_id": patient_id,  # Each patient has persistent thread
-        }
-    }
-
-    # Execute graph with checkpointer
     try:
         final_state = await _graph.ainvoke(initial_state, config)
     except Exception as e:
         logger.error(f"Graph execution failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"MediTwin analysis failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"MediTwin analysis failed: {str(e)}")
 
     elapsed = round(time.time() - start_time, 2)
-    logger.info(f"Analysis complete in {elapsed}s — "
-                f"status={final_state.get('consensus_output', {}).get('consensus_status', '?')}")
+    logger.info(f"Analysis complete in {elapsed}s")
 
-    # Check for fatal patient context failure
     if final_state.get("patient_state") is None:
         return JSONResponse(
             status_code=503,
@@ -197,50 +209,150 @@ async def analyze(
             },
         )
 
-    # Build response
-    final_output = final_state.get("final_output") or {}
-    response = {
-        "patient_id": patient_id,
-        "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
-        "elapsed_seconds": elapsed,
-        "imaging_performed": bool(request.image_data),
+    return JSONResponse(content=_build_final_response(
+        final_state, patient_id, elapsed, bool(request.image_data)
+    ))
 
-        # Core clinical outputs from Explanation Agent
-        "clinician_output":  final_output.get("clinician_output"),
-        "patient_output":    final_output.get("patient_output"),
-        "risk_attribution":  final_output.get("risk_attribution"),
-        "fhir_bundle":       final_output.get("fhir_bundle"),
-        "reading_level_check": final_output.get("reading_level_check"),
 
-        # Consensus summary
-        "consensus": {
-            "status":               final_state.get("consensus_output", {}).get("consensus_status"),
-            "aggregate_confidence": final_state.get("consensus_output", {}).get("aggregate_confidence"),
-            "human_review_required": final_state.get("human_review_required", False),
-            "conflict_count":       final_state.get("consensus_output", {}).get("conflict_count", 0),
-            "summary":              final_state.get("consensus_output", {}).get("consensus_summary"),
+# ── POST /analyze/stream — SSE streaming endpoint ─────────────────────────────
+@app.post("/analyze/stream")
+async def analyze_stream(
+    request: MediTwinRequest,
+    x_sharp_patient_id:   Optional[str] = Header(None),
+    x_sharp_fhir_token:   Optional[str] = Header(None),
+    x_sharp_fhir_base_url: Optional[str] = Header(None),
+) -> StreamingResponse:
+    """
+    Real-time streaming endpoint using Server-Sent Events (SSE).
+
+    Stream events (JSON after 'data: '):
+      {"type": "status",    "node": "...", "message": "...", "step": N, "total_steps": 7}
+      {"type": "result",    "node": "...", "message": "...", "summary": {...}}
+      {"type": "error",     "node": "...", "message": "..."}
+      {"type": "complete",  "node": "...", "message": "...", "summary": {...}}
+      {"type": "llm_token", "node": "...", "token": "..."}
+      {"type": "final",     "data": { ...full MediTwin response... }}
+      [DONE]
+
+    Client usage (JavaScript):
+      const es = new EventSource('/analyze/stream', {method:'POST', ...});
+      es.onmessage = (e) => {
+        if (e.data === '[DONE]') { es.close(); return; }
+        const event = JSON.parse(e.data);
+        console.log(event.type, event.node, event.message);
+      };
+    """
+    patient_id    = x_sharp_patient_id    or request.patient_id
+    sharp_token   = x_sharp_fhir_token    or request.sharp_token or ""
+    fhir_base_url = x_sharp_fhir_base_url or request.fhir_base_url or "https://hapi.fhir.org/baseR4"
+
+    if not patient_id:
+        raise HTTPException(status_code=400, detail="patient_id is required")
+    if not request.chief_complaint:
+        raise HTTPException(status_code=400, detail="chief_complaint is required")
+
+    initial_state = _build_initial_state(
+        patient_id, request.chief_complaint, fhir_base_url, sharp_token, request.image_data
+    )
+    config = {"configurable": {"thread_id": patient_id}}
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        start_time = time.time()
+        final_state = None
+
+        def sse(data: dict) -> str:
+            """Format a dict as an SSE data line."""
+            return f"data: {json.dumps(data)}\n\n"
+
+        try:
+            # Stream with all three modes:
+            # - "messages": LLM token chunks (from any ChatModel inside nodes)
+            # - "updates":  full node state updates (when node finishes)
+            # - "custom":   get_stream_writer() events (our status/result events)
+            async for chunk in _graph.astream(
+                initial_state,
+                config=config,
+                stream_mode=["messages", "updates", "custom"],
+                version="v2",
+            ):
+                chunk_type = chunk.get("type") if isinstance(chunk, dict) else None
+
+                # ── Custom events from get_stream_writer() ────────────────────
+                # These are our status/result/error/complete events
+                if chunk_type == "custom":
+                    event_data = chunk.get("data", {})
+                    yield sse(event_data)
+
+                # ── LLM message tokens ─────────────────────────────────────────
+                # Stream individual tokens from any LLM node
+                elif chunk_type == "messages":
+                    message_chunk, metadata = chunk.get("data", (None, None))
+                    if message_chunk and hasattr(message_chunk, "content"):
+                        content = message_chunk.content
+                        if content and content.strip():
+                            node_name = metadata.get("langgraph_node", "llm") if metadata else "llm"
+                            yield sse({
+                                "type": "llm_token",
+                                "node": node_name,
+                                "token": content,
+                            })
+
+                # ── Node updates — capture final state ────────────────────────
+                # Use this to track final_state for the /final event
+                elif chunk_type == "updates":
+                    node_updates = chunk.get("data", {})
+                    # Merge into our final_state tracker
+                    if final_state is None:
+                        final_state = dict(initial_state)
+                    for node_name, state_update in node_updates.items():
+                        if isinstance(state_update, dict):
+                            # Merge lists (error_log uses operator.add)
+                            for k, v in state_update.items():
+                                if k == "error_log" and isinstance(v, list):
+                                    existing = final_state.get("error_log", [])
+                                    final_state["error_log"] = existing + v
+                                else:
+                                    final_state[k] = v
+
+        except Exception as e:
+            logger.error(f"Stream error: {e}", exc_info=True)
+            yield sse({
+                "type": "error",
+                "node": "orchestrator",
+                "message": f"❌ Stream failed: {str(e)}",
+            })
+
+        # ── Emit the complete final response ──────────────────────────────────
+        elapsed = round(time.time() - start_time, 2)
+
+        if final_state and final_state.get("patient_state") is None:
+            yield sse({
+                "type": "fatal_error",
+                "message": "Patient Context Agent failed — cannot retrieve patient data",
+                "patient_id": patient_id,
+                "elapsed_seconds": elapsed,
+            })
+        elif final_state:
+            final_response = _build_final_response(
+                final_state, patient_id, elapsed, bool(request.image_data)
+            )
+            yield sse({"type": "final", "data": final_response})
+
+        # Signal stream end
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection":    "keep-alive",
+            "X-Accel-Buffering": "no",   # Disable nginx buffering
         },
-
-        # Individual agent outputs (for debugging / downstream consumption)
-        "agent_outputs": {
-            "diagnosis":    final_state.get("diagnosis_output"),
-            "lab":          final_state.get("lab_output"),
-            "imaging":      final_state.get("imaging_output"),
-            "drug_safety":  final_state.get("drug_safety_output"),
-            "digital_twin": final_state.get("digital_twin_output"),
-        },
-
-        # Execution metadata
-        "error_log": final_state.get("error_log", []),
-        "meditwin_version": "1.0.0",
-        "memory_enabled": True,  # PostgreSQL checkpointer active
-    }
-
-    return JSONResponse(content=response)
+    )
 
 
-# ── Health check ──────────────────────────────────────────────────────────────
-
+# ── Health check ───────────────────────────────────────────────────────────────
 AGENT_ENDPOINTS = {
     "patient_context": f"{PATIENT_CONTEXT_URL}/health",
     "diagnosis":       f"{DIAGNOSIS_URL}/health",
@@ -254,7 +366,6 @@ AGENT_ENDPOINTS = {
 
 
 async def _check_agent(name: str, url: str) -> dict:
-    """Check a single downstream agent's health endpoint."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(url)
@@ -267,25 +378,16 @@ async def _check_agent(name: str, url: str) -> dict:
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """
-    Health check — polls all 8 downstream agents concurrently.
-    Reports which are up/down for demo monitoring.
-    
-    Also includes PostgreSQL checkpointer status.
-    """
     results = await asyncio.gather(*[
         _check_agent(name, url)
         for name, url in AGENT_ENDPOINTS.items()
     ])
-
     agent_health = dict(zip(AGENT_ENDPOINTS.keys(), results))
     healthy_count = sum(1 for v in agent_health.values() if v["status"] == "healthy")
-    all_healthy = healthy_count == len(AGENT_ENDPOINTS)
-    
-    # Check checkpointer status
+
     checkpointer_status = "unknown"
     try:
-        if _graph and hasattr(_graph, 'checkpointer'):
+        if _graph and hasattr(_graph, "checkpointer"):
             checkpointer_status = "active"
         else:
             checkpointer_status = "not configured"
@@ -293,7 +395,7 @@ async def health() -> JSONResponse:
         checkpointer_status = "error"
 
     return JSONResponse(content={
-        "status": "healthy" if all_healthy else "degraded",
+        "status": "healthy" if healthy_count == len(AGENT_ENDPOINTS) else "degraded",
         "orchestrator": "healthy",
         "agents_healthy": healthy_count,
         "agents_total": len(AGENT_ENDPOINTS),
@@ -301,36 +403,31 @@ async def health() -> JSONResponse:
         "graph_compiled": _graph is not None,
         "checkpointer": checkpointer_status,
         "memory_enabled": checkpointer_status == "active",
-        "version": "1.0.0",
+        "streaming_enabled": True,
+        "stream_endpoint": "POST /analyze/stream",
+        "version": "1.1.0",
     })
 
 
 # ── A2A Agent Card ─────────────────────────────────────────────────────────────
-
 @app.get("/.well-known/agent-card")
 async def agent_card() -> JSONResponse:
-    """
-    A2A Agent Card — published to Prompt Opinion Marketplace.
-    Describes MediTwin's capabilities and SHARP context requirements.
-    """
     return JSONResponse(content={
         "name": "MediTwin AI",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "description": (
-            "Multi-agent clinical decision support system. "
-            "Combines 8 specialist AI agents to produce a comprehensive medical assessment: "
-            "differential diagnosis, lab interpretation, medical imaging triage (CNN), "
-            "drug safety checking (FDA data), digital twin outcome simulation, "
-            "and plain-language patient communication — all FHIR R4 compliant. "
-            "Includes short-term memory for conversation continuity."
+            "Multi-agent clinical decision support system with real-time streaming. "
+            "8 specialist AI agents producing differential diagnosis, lab interpretation, "
+            "imaging triage (CNN), drug safety (FDA), digital twin outcome simulation, "
+            "and plain-language patient communication — all FHIR R4 compliant."
         ),
         "author": "Tayyab Hussain",
         "tagline": "What is happening? What will happen next? What should we do?",
         "input_schema": {
             "type": "object",
             "properties": {
-                "patient_id":      {"type": "string", "description": "FHIR Patient resource ID"},
-                "chief_complaint": {"type": "string", "description": "Primary reason for visit"},
+                "patient_id":      {"type": "string"},
+                "chief_complaint": {"type": "string"},
                 "image_data":      {"type": "string", "description": "Base64 chest X-ray (optional)"},
             },
             "required": ["patient_id", "chief_complaint"],
@@ -338,7 +435,6 @@ async def agent_card() -> JSONResponse:
         "sharp_context": {
             "consumes": ["patient_id", "fhir_token", "fhir_base_url"],
             "required": False,
-            "description": "SHARP headers enable direct FHIR server access",
         },
         "capabilities": [
             "differential_diagnosis",
@@ -349,8 +445,15 @@ async def agent_card() -> JSONResponse:
             "consensus_conflict_detection",
             "fhir_r4_compliant_output",
             "patient_plain_language_explanation",
-            "short_term_memory_persistence",  # NEW: checkpointer capability
+            "short_term_memory_persistence",
+            "real_time_sse_streaming",
         ],
+        "endpoints": {
+            "analyze":        "POST /analyze         — full JSON response",
+            "analyze_stream": "POST /analyze/stream  — SSE real-time stream",
+            "health":         "GET  /health",
+            "agent_card":     "GET  /.well-known/agent-card",
+        },
         "agents": [
             {"id": 1, "name": "Patient Context Agent",      "port": 8001, "type": "A2A"},
             {"id": 2, "name": "Diagnosis Agent",            "port": 8002, "type": "A2A"},
@@ -362,15 +465,20 @@ async def agent_card() -> JSONResponse:
             {"id": 8, "name": "Explanation Agent",          "port": 8009, "type": "A2A"},
         ],
         "mcp_superpower": {
-            "name": "drug-safety-mcp",
+            "name":     "drug-safety-mcp",
             "endpoint": f"{DRUG_SAFETY_URL}/mcp/",
-            "tools": ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
+            "tools":    ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
         },
         "memory": {
-            "type": "short_term",
+            "type":           "short_term",
             "implementation": "PostgreSQL checkpointer",
-            "scope": "thread_scoped (per patient_id)",
-            "persistence": "database_backed",
+            "scope":          "thread_scoped (per patient_id)",
+        },
+        "streaming": {
+            "protocol":    "Server-Sent Events (SSE)",
+            "endpoint":    "POST /analyze/stream",
+            "event_types": ["status", "result", "error", "complete", "llm_token", "final"],
+            "modes":       ["messages", "updates", "custom"],
         },
     })
 
