@@ -30,6 +30,11 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from streaming_graph import stream_full_analysis
+from shared.sse_utils import SSE_HEADERS
+
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from graph import build_meditwin_graph_with_checkpointer
@@ -86,6 +91,7 @@ app = FastAPI(
     version="1.1.0",
     lifespan=lifespan,
 )
+
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -214,144 +220,6 @@ async def analyze(
     ))
 
 
-# ── POST /analyze/stream — SSE streaming endpoint ─────────────────────────────
-@app.post("/analyze/stream")
-async def analyze_stream(
-    request: MediTwinRequest,
-    x_sharp_patient_id:   Optional[str] = Header(None),
-    x_sharp_fhir_token:   Optional[str] = Header(None),
-    x_sharp_fhir_base_url: Optional[str] = Header(None),
-) -> StreamingResponse:
-    """
-    Real-time streaming endpoint using Server-Sent Events (SSE).
-
-    Stream events (JSON after 'data: '):
-      {"type": "status",    "node": "...", "message": "...", "step": N, "total_steps": 7}
-      {"type": "result",    "node": "...", "message": "...", "summary": {...}}
-      {"type": "error",     "node": "...", "message": "..."}
-      {"type": "complete",  "node": "...", "message": "...", "summary": {...}}
-      {"type": "llm_token", "node": "...", "token": "..."}
-      {"type": "final",     "data": { ...full MediTwin response... }}
-      [DONE]
-
-    Client usage (JavaScript):
-      const es = new EventSource('/analyze/stream', {method:'POST', ...});
-      es.onmessage = (e) => {
-        if (e.data === '[DONE]') { es.close(); return; }
-        const event = JSON.parse(e.data);
-        console.log(event.type, event.node, event.message);
-      };
-    """
-    patient_id    = x_sharp_patient_id    or request.patient_id
-    sharp_token   = x_sharp_fhir_token    or request.sharp_token or ""
-    fhir_base_url = x_sharp_fhir_base_url or request.fhir_base_url or "https://hapi.fhir.org/baseR4"
-
-    if not patient_id:
-        raise HTTPException(status_code=400, detail="patient_id is required")
-    if not request.chief_complaint:
-        raise HTTPException(status_code=400, detail="chief_complaint is required")
-
-    initial_state = _build_initial_state(
-        patient_id, request.chief_complaint, fhir_base_url, sharp_token, request.image_data
-    )
-    config = {"configurable": {"thread_id": patient_id}}
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        start_time = time.time()
-        final_state = None
-
-        def sse(data: dict) -> str:
-            """Format a dict as an SSE data line."""
-            return f"data: {json.dumps(data)}\n\n"
-
-        try:
-            # Stream with all three modes:
-            # - "messages": LLM token chunks (from any ChatModel inside nodes)
-            # - "updates":  full node state updates (when node finishes)
-            # - "custom":   get_stream_writer() events (our status/result events)
-            async for chunk in _graph.astream(
-                initial_state,
-                config=config,
-                stream_mode=["messages", "updates", "custom"],
-                version="v2",
-            ):
-                chunk_type = chunk.get("type") if isinstance(chunk, dict) else None
-
-                # ── Custom events from get_stream_writer() ────────────────────
-                # These are our status/result/error/complete events
-                if chunk_type == "custom":
-                    event_data = chunk.get("data", {})
-                    yield sse(event_data)
-
-                # ── LLM message tokens ─────────────────────────────────────────
-                # Stream individual tokens from any LLM node
-                elif chunk_type == "messages":
-                    message_chunk, metadata = chunk.get("data", (None, None))
-                    if message_chunk and hasattr(message_chunk, "content"):
-                        content = message_chunk.content
-                        if content and content.strip():
-                            node_name = metadata.get("langgraph_node", "llm") if metadata else "llm"
-                            yield sse({
-                                "type": "llm_token",
-                                "node": node_name,
-                                "token": content,
-                            })
-
-                # ── Node updates — capture final state ────────────────────────
-                # Use this to track final_state for the /final event
-                elif chunk_type == "updates":
-                    node_updates = chunk.get("data", {})
-                    # Merge into our final_state tracker
-                    if final_state is None:
-                        final_state = dict(initial_state)
-                    for node_name, state_update in node_updates.items():
-                        if isinstance(state_update, dict):
-                            # Merge lists (error_log uses operator.add)
-                            for k, v in state_update.items():
-                                if k == "error_log" and isinstance(v, list):
-                                    existing = final_state.get("error_log", [])
-                                    final_state["error_log"] = existing + v
-                                else:
-                                    final_state[k] = v
-
-        except Exception as e:
-            logger.error(f"Stream error: {e}", exc_info=True)
-            yield sse({
-                "type": "error",
-                "node": "orchestrator",
-                "message": f"❌ Stream failed: {str(e)}",
-            })
-
-        # ── Emit the complete final response ──────────────────────────────────
-        elapsed = round(time.time() - start_time, 2)
-
-        if final_state and final_state.get("patient_state") is None:
-            yield sse({
-                "type": "fatal_error",
-                "message": "Patient Context Agent failed — cannot retrieve patient data",
-                "patient_id": patient_id,
-                "elapsed_seconds": elapsed,
-            })
-        elif final_state:
-            final_response = _build_final_response(
-                final_state, patient_id, elapsed, bool(request.image_data)
-            )
-            yield sse({"type": "final", "data": final_response})
-
-        # Signal stream end
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection":    "keep-alive",
-            "X-Accel-Buffering": "no",   # Disable nginx buffering
-        },
-    )
-
-
 # ── Health check ───────────────────────────────────────────────────────────────
 AGENT_ENDPOINTS = {
     "patient_context": f"{PATIENT_CONTEXT_URL}/health",
@@ -364,6 +232,26 @@ AGENT_ENDPOINTS = {
     "explanation":     f"{EXPLANATION_URL}/health",
 }
 
+@app.post("/analyze/stream")
+async def analyze_stream(
+    request: MediTwinRequest,
+    x_sharp_patient_id:    Optional[str] = Header(None),
+    x_sharp_fhir_token:    Optional[str] = Header(None),
+    x_sharp_fhir_base_url: Optional[str] = Header(None),
+) -> StreamingResponse:
+    
+    patient_id    = x_sharp_patient_id    or request.patient_id
+    sharp_token   = x_sharp_fhir_token    or request.sharp_token or ""
+    fhir_base_url = x_sharp_fhir_base_url or request.fhir_base_url or "https://hapi.fhir.org/baseR4"
+    if not patient_id:
+        raise HTTPException(status_code=400, detail="patient_id is required")
+    if not request.chief_complaint:
+        raise HTTPException(status_code=400, detail="chief_complaint is required")
+    return StreamingResponse(
+        stream_full_analysis(patient_id, request.chief_complaint, fhir_base_url, sharp_token, request.image_data),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 async def _check_agent(name: str, url: str) -> dict:
     try:

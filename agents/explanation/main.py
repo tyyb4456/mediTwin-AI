@@ -26,6 +26,8 @@ import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from stream_endpoints import explanation_router as stream_router
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from soap_generator import generate_soap_note, MEDICAL_DISCLAIMER
@@ -102,6 +104,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.include_router(stream_router)
 
 
 # ── Risk attribution helpers ───────────────────────────────────────────────────

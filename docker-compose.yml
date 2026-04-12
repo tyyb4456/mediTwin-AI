@@ -73,7 +73,7 @@ services:
     #   retries: 5
     restart: unless-stopped
 
-# ── One-time setup: Knowledge Base Ingest ──
+  # ── One-time setup: Knowledge Base Ingest ──
   diagnosis-ingest:
     build:
       context: .
@@ -88,7 +88,7 @@ services:
       - chromadb
     networks:
       - meditwin-network
-    restart: "no"  # Run once and exit
+    restart: "no"
 
   # ── One-time setup: Digital Twin Model Training ──
   digital-twin-train:
@@ -99,7 +99,7 @@ services:
     command: python /app/agent/train_models.py
     networks:
       - meditwin-network
-    restart: "no"  # Run once and exit
+    restart: "no"
 
   # ── Agent 1: Patient Context Agent (port 8001) ──────────────────────────────
 
@@ -141,15 +141,12 @@ services:
       - CHROMADB_PORT=8000
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
-      - chromadb
-      - diagnosis-ingest  # waits for ingest to complete
+      chromadb:
+        condition: service_started
+      diagnosis-ingest:
+        condition: service_completed_successfully
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 3: Lab Analysis Agent (port 8003) ───────────────────────────────────
@@ -226,9 +223,9 @@ services:
       - "8006:8006"
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-
     depends_on:
-      - digital-twin-train  # waits for training to complete
+      digital-twin-train:
+        condition: service_completed_successfully
     networks:
       - meditwin-network
     # healthcheck:
@@ -255,11 +252,6 @@ services:
       - chromadb
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
     restart: unless-stopped
 
   # ── Agent 8: Explanation Agent (port 8009) ────────────────────────────────────
@@ -275,78 +267,46 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
       - meditwin-network
-
     depends_on:
-      - digital-twin-train  # ← add this
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
+      digital-twin-train:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # ── Agent 9: Orchestrator — Main Entry Point (port 8000) ──────────────────────
 
   orchestrator:
-      build:
-        context: .
-        dockerfile: orchestrator/Dockerfile
-      container_name: meditwin-orchestrator
-      ports:
-        - "8000:8000"
-      environment:
-        - PATIENT_CONTEXT_URL=http://patient-context:8001
-        - DIAGNOSIS_URL=http://diagnosis:8002
-        - LAB_ANALYSIS_URL=http://lab-analysis:8003
-        - DRUG_SAFETY_URL=http://drug-safety:8004
-        - IMAGING_TRIAGE_URL=http://imaging-triage:8005
-        - DIGITAL_TWIN_URL=http://digital-twin:8006
-        - CONSENSUS_URL=http://consensus:8007
-        - EXPLANATION_URL=http://explanation:8009
-        - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-        # PostgreSQL checkpointer connection
-        - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints
-      depends_on:
-        - patient-context
-        - diagnosis
-        - lab-analysis
-        - drug-safety
-        - imaging-triage
-        - digital-twin
-        - consensus
-        - explanation
-        - postgres-checkpoint  # NEW: wait for checkpoint DB
-      networks:
-        - meditwin-network
-      # healthcheck:
-      #   test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      #   interval: 60s
-      #   timeout: 5s
-      #   retries: 5
-      restart: unless-stopped
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: meditwin-orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - PATIENT_CONTEXT_URL=http://patient-context:8001
+      - DIAGNOSIS_URL=http://diagnosis:8002
+      - LAB_ANALYSIS_URL=http://lab-analysis:8003
+      - DRUG_SAFETY_URL=http://drug-safety:8004
+      - IMAGING_TRIAGE_URL=http://imaging-triage:8005
+      - DIGITAL_TWIN_URL=http://digital-twin:8006
+      - CONSENSUS_URL=http://consensus:8007
+      - EXPLANATION_URL=http://explanation:8009
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints
+    depends_on:
+      - patient-context
+      - diagnosis
+      - lab-analysis
+      - drug-safety
+      - imaging-triage
+      - digital-twin
+      - consensus
+      - explanation
+      - postgres-checkpoint
+    networks:
+      - meditwin-network
+    restart: unless-stopped
 
-# ── Agent 10: Tool Agent — ReAct LLM tool-calling agent (port 8010) ──────────
-#
-# Add this service block to your docker-compose.yml under `services:`.
-# Also add 'tool-agent' to the orchestrator's `depends_on` list (optional).
-#
-# Difference from Orchestrator (8000):
-#   Orchestrator:  deterministic graph, fixed node order, all agents always run
-#   Tool Agent:    LLM-driven ReAct loop, selects tools per query, supports /chat
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ADD THIS BLOCK to your docker-compose.yml under `services:`
-#
-# Agent 10: Tool Agent — Conservative ReAct tool-calling agent (port 8010)
-#
-# Behavior:
-#   Query WITH patient ID  → fetches context, calls only relevant tools
-#   Query WITHOUT patient  → answers from general medical knowledge, no tools
-#
-# This is the ONLY difference from Orchestrator (8000):
-#   Orchestrator: always runs all 8 agents in fixed deterministic order
-#   Tool Agent:   LLM triage — zero to selective tools based on query intent
-# ─────────────────────────────────────────────────────────────────────────────
+  # ── Agent 10: Tool Agent (port 8010) ──────────────────────────────────────────
 
   tool-agent:
     build:
@@ -365,8 +325,6 @@ services:
       - CONSENSUS_URL=http://consensus:8007
       - EXPLANATION_URL=http://explanation:8009
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      # Shares the same PostgreSQL checkpoint DB as the orchestrator
-      # Thread prefix: "default" or user-supplied session_id
       - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints
       - INTERNAL_TOKEN=meditwin-internal
     depends_on:
@@ -381,11 +339,6 @@ services:
       - postgres-checkpoint
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
     restart: unless-stopped
 
 networks:
@@ -394,4 +347,4 @@ networks:
 
 volumes:
   chromadb-data:
-  postgres-checkpoint-data:  # NEW: persist checkpoint data
+  postgres-checkpoint-data:

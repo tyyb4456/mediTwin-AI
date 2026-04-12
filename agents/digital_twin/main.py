@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 import numpy as np
 import xgboost as xgb
 from fastapi import FastAPI, HTTPException
+
+from stream_endpoints import twin_router as stream_router
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from dotenv import load_dotenv
@@ -175,6 +177,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(stream_router)
 
 # ── Inference Helpers ─────────────────────────────────────────────────────────
 

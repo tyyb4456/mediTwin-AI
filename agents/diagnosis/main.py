@@ -26,6 +26,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from rag import diagnosis
 
+from stream_endpoint import router as stream_router
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s [%(request_id)s] — %(message)s"
@@ -111,6 +113,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(stream_router)
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 

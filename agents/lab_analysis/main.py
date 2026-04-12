@@ -19,6 +19,8 @@ from contextlib import asynccontextmanager
 from typing import Optional, List
 from datetime import datetime, timedelta
 
+from stream_endpoint import lab_router as stream_router
+
 from fastapi import FastAPI, HTTPException
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -141,6 +143,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(stream_router)
 
 # ── Trend Analysis ────────────────────────────────────────────────────────────
 
@@ -154,6 +157,9 @@ def analyze_trends(
     Critical for identifying rapid deterioration or improvement.
     """
     if not previous_labs:
+        return []
+
+    if not isinstance(previous_labs[0], dict):
         return []
     
     trends = []

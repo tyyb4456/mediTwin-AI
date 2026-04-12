@@ -31,6 +31,8 @@ from typing import Optional
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException
+from stream_endpoints import consensus_router as stream_router
+
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict
@@ -381,7 +383,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
-
+app.include_router(stream_router)
 
 @app.post("/consensus", response_model=ConsensusResponse)
 async def consensus(request: ConsensusRequest) -> ConsensusResponse:

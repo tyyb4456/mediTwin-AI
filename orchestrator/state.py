@@ -18,7 +18,7 @@ class MediTwinState(TypedDict):
     patient_id: str
     chief_complaint: str
     fhir_base_url: str
-    sharp_token: str                    # SHARP bearer token (may be empty)
+    sharp_token: Optional[str]                    # SHARP bearer token (may be empty)
     image_data: Optional[str]           # base64 chest X-ray (optional)
     imaging_available: bool             # derived from image_data presence
 

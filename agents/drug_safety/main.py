@@ -39,6 +39,9 @@ from typing import Optional, Annotated
 import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+
+from stream_endpoints import drug_router as stream_router
+        
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -621,6 +624,8 @@ combined_app = Starlette(
         Mount("/",    app=rest_app),
     ]
 )
+
+rest_app.include_router(stream_router)
 
 
 if __name__ == "__main__":
