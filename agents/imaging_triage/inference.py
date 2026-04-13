@@ -55,6 +55,20 @@ _model_loaded = False
 _model_error: Optional[str] = None
 
 
+# ── FIX: accessor functions so callers always read live state ──────────────────
+# The root cause of "model not loaded" even when file exists:
+#   from inference import _model_loaded   ← copies the bool VALUE at import time
+#   Later, load_model_from_disk() sets _model_loaded = True in this module,
+#   but the caller's local copy never updates.
+# Solution: always call is_model_loaded() instead of importing the bare bool.
+
+def is_model_loaded() -> bool:
+    return _model_loaded
+
+def get_model_error() -> Optional[str]:
+    return _model_error
+
+
 def load_model_from_disk() -> bool:
     global _model, _model_loaded, _model_error
 
