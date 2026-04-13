@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir --timeout=300 \
     "uvicorn[standard]" \
     pydantic \
     pydantic-settings \
+    asyncpg \
     langchain \
     langchain-google-genai \
     langchain-core \

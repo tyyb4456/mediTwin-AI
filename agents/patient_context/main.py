@@ -53,6 +53,9 @@ from shared.redis_client import redis_client
 
 from stream_endpoint import router as stream_router
 
+from db import init as db_init, close as db_close, save_patient_context, PatientContextRecord
+from history_router import router as history_router
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -125,6 +128,8 @@ async def lifespan(app: FastAPI):
     logger.info("✓ Redis connection established")
     logger.info("✓ Patient Context Agent ready on port 8001")
     logger.info("═" * 60)
+
+    await db_init()
     
     yield
     
@@ -132,6 +137,7 @@ async def lifespan(app: FastAPI):
     logger.info("Patient Context Agent shutting down...")
     await http_client.aclose()
     await redis_client.disconnect()
+    await db_close()
     logger.info("✓ Patient Context Agent shutdown complete")
 
 
@@ -153,8 +159,9 @@ app = FastAPI(
 )
 
 app.include_router(stream_router)
+app.include_router(history_router, prefix="/history", tags=["history"])
 
-from help import (
+from agents.patient_context.utils import (
     fetch_fhir_resource,
     normalize_patient,
     normalize_conditions,
@@ -279,6 +286,25 @@ async def fetch_patient_context(
         allergies = normalize_allergies(allergies_bundle)
         labs = normalize_observations(observations_bundle)
         diagnostic_reports, imaging_available = normalize_diagnostic_reports(diagnostic_reports_bundle)
+
+        import uuid
+        request_id = str(uuid.uuid4())[:8]
+        await save_patient_context(PatientContextRecord(
+            request_id=request_id,
+            patient_id=patient_id,
+            source=source,
+            fhir_base_url=fhir_base_url,
+            fhir_resources_fetched=6,  # 0 on cache hit
+            demographics=demographics.model_dump() if demographics else None,
+            active_conditions=[c.model_dump() for c in conditions],
+            medications=[m.model_dump() for m in medications],
+            allergies=[a.model_dump() for a in allergies],
+            lab_results=[l.model_dump() for l in labs],
+            diagnostic_reports=[r.model_dump() for r in diagnostic_reports],
+            imaging_available=imaging_available,
+            cache_hit=False,
+            fetch_time_ms=elapsed_ms,
+        ))
         
         # Build PatientState
         patient_state = PatientState(

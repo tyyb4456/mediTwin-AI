@@ -28,6 +28,8 @@ from rag import diagnosis
 
 from stream_endpoint import router as stream_router
 
+from db import init as db_init, close as db_close, save_diagnosis, DiagnosisRecord
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s [%(request_id)s] — %(message)s"
@@ -99,7 +101,11 @@ async def lifespan(app: FastAPI):
             logger.error(f"FATAL: Could not initialize even in fallback mode: {e2}")
             # Don't sys.exit — let FastAPI start anyway so /health returns degraded status
 
+    await db_init()          # ← ADD THIS
+ 
     yield
+ 
+    await db_close()         # ← ADD THIS
     logger.info("✓ Diagnosis Agent shutdown")
 
 
@@ -114,6 +120,18 @@ app = FastAPI(
 )
 
 app.include_router(stream_router)
+from history_router import router as history_router
+app.include_router(history_router, prefix="/history", tags=["history"])
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -151,6 +169,25 @@ async def diagnose(request: DiagnoseRequest) -> DiagnoseResponse:
             fhir_conditions = diagnosis.build_fhir_conditions(result, patient_id)
         except Exception as e:
             logger.warning(f"[{request_id}] FHIR condition build failed (non-fatal): {e}")
+
+    db_record = DiagnosisRecord(
+        request_id=request_id,
+        patient_id=patient_id,
+        chief_complaint=request.chief_complaint,
+        top_diagnosis=result.top_diagnosis,
+        top_icd10_code=result.top_icd10_code,
+        confidence_level=result.confidence_level,
+        rag_mode="rag" if diagnosis.rag_available else "fallback",
+        differential_diagnosis=[d.model_dump() for d in result.differential_diagnosis],
+        recommended_next_steps=[s.model_dump() for s in result.recommended_next_steps],
+        fhir_conditions=fhir_conditions,
+        penicillin_alert=result.penicillin_allergy_flagged,
+        sepsis_alert=result.high_suspicion_sepsis,
+        requires_isolation=result.requires_isolation,
+        cache_hit=False,
+        source="diagnose",
+    )
+    await save_diagnosis(db_record)   # non-fatal — won't break response
 
     return DiagnoseResponse(
         request_id=request_id,

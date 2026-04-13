@@ -115,9 +115,13 @@ services:
       - REDIS_PORT=6379
       - FHIR_BASE_URL=https://hapi.fhir.org/baseR4
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin   # ← ADD
+      - INTERNAL_TOKEN=meditwin-internal  
     depends_on:
       redis:
         condition: service_healthy
+      postgres-checkpoint:           # ← ADD
+        condition: service_started
     networks:
       - meditwin-network
     # healthcheck:
@@ -140,11 +144,15 @@ services:
       - CHROMADB_HOST=chromadb
       - CHROMADB_PORT=8000
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin   # ← ADD
+      - INTERNAL_TOKEN=meditwin-internal                                                           # ← ADD (for /cache-clear and DELETE /history)
     depends_on:
       chromadb:
         condition: service_started
       diagnosis-ingest:
         condition: service_completed_successfully
+      postgres-checkpoint:           # ← ADD
+        condition: service_started
     networks:
       - meditwin-network
     restart: unless-stopped
@@ -160,6 +168,11 @@ services:
       - "8003:8003"
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin   # ← ADD
+      - INTERNAL_TOKEN=meditwin-internal  
+    depends_on:
+      postgres-checkpoint:           # ← ADD
+        condition: service_started
     networks:
       - meditwin-network
     # healthcheck:

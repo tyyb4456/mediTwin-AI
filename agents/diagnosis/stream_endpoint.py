@@ -38,6 +38,8 @@ from shared.sse_utils import (
     evt_status, evt_progress, evt_error, evt_complete, evt_token, sse_done,
 )
 
+from db import save_diagnosis, DiagnosisRecord
+
 router = APIRouter()
 
 
@@ -147,48 +149,63 @@ async def _stream_diagnose(
         ("human", HUMAN_PROMPT),
     ])
 
+    chain = prompt | diagnosis._structured_llm
+
     full_response = ""
     token_count = 0
+    output = None
+
 
     try:
-        # Stream tokens from the LLM directly
-        chain = prompt | diagnosis._llm  # raw LLM, no structured output parser yet
-        async for chunk in chain.astream({
-            "context": context,
-            "patient_data": patient_query,
-        }):
-            token = chunk.content if hasattr(chunk, "content") else str(chunk)
-            if token:
-                full_response += token
-                token_count += 1
-                yield evt_token(node, token)
+        async for event in chain.astream_events(
+            {"context": context, "patient_data": patient_query},
+            version="v2",
+        ):
+            kind = event["event"]
+            name = event["name"]
+
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if hasattr(chunk, "content") and chunk.content:
+                    token_count += 1
+                    yield evt_token(node, chunk.content)
+
+            elif kind == "on_chain_end" and name == "RunnableSequence":
+                raw = event["data"].get("output")
+                if isinstance(raw, DiagnosisOutput):
+                    output = raw
+                elif isinstance(raw, dict):
+                    if "differential_diagnosis" in raw:
+                        raw["differential_diagnosis"] = _validate_and_repair_items(
+                            raw["differential_diagnosis"]
+                        )
+                    try:
+                        output = DiagnosisOutput(**raw)
+                    except Exception as parse_exc:
+                        yield evt_error(node, f"Parse failed: {parse_exc}")
 
     except Exception as exc:
-        yield evt_error(node, f"LLM streaming failed: {exc} — retrying non-streaming")
-        # Fall back to non-streaming invoke
+        yield evt_error(node, f"LLM streaming failed: {exc} — falling back")
         try:
-            result_obj = await asyncio.to_thread(
+            output = await asyncio.to_thread(
                 diagnosis._invoke_llm, patient_query, context, system_prompt
             )
-            full_response = result_obj.model_dump_json()
         except Exception as exc2:
             yield evt_error(node, f"LLM completely failed: {exc2}", fatal=True)
             return
+        if output is None:
+            yield evt_error(node, "No output produced by LLM or fallback", fatal=True)
+            return
 
     yield evt_progress(node,
-                       f"LLM generated {token_count} tokens — parsing response...",
-                       pct=70)
+                    f"LLM generated {token_count} tokens — structured output ready",
+                    pct=70)
 
-    # ── Step 5: Parse + validate LLM output ───────────────────────────────────
-    yield evt_status(node, "Parsing and validating LLM output...", step=4, total=5)
+    # ── Step 5: Validate output ────────────────────────────────────────────────
+    yield evt_status(node, "Validating structured LLM output...", step=4, total=5)
 
-    try:
-        output = _parse_llm_response(full_response, diagnosis)
-        if output is None:
-            yield evt_error(node, "Could not parse LLM output as DiagnosisOutput", fatal=True)
-            return
-    except Exception as exc:
-        yield evt_error(node, f"Parse error: {exc}", fatal=True)
+    if output is None or not isinstance(output, DiagnosisOutput):
+        yield evt_error(node, "Structured LLM returned no valid DiagnosisOutput", fatal=True)
         return
 
     # ── Step 6: Rule adjustments ───────────────────────────────────────────────
@@ -222,6 +239,25 @@ async def _stream_diagnose(
     elapsed = timer.elapsed_ms()
     output_dict = _diagnosis_output_to_dict(output)
 
+    await save_diagnosis(DiagnosisRecord(
+        request_id=request_id,
+        patient_id=patient_id,
+        chief_complaint=chief_complaint,
+        top_diagnosis=output.top_diagnosis,
+        top_icd10_code=output.top_icd10_code,
+        confidence_level=output.confidence_level,
+        rag_mode="rag" if diagnosis.rag_available else "fallback",
+        differential_diagnosis=[d.model_dump() for d in output.differential_diagnosis],
+        recommended_next_steps=[s.model_dump() for s in output.recommended_next_steps],
+        fhir_conditions=fhir_conditions,
+        penicillin_alert=output.penicillin_allergy_flagged,
+        sepsis_alert=output.high_suspicion_sepsis,
+        requires_isolation=output.requires_isolation,
+        cache_hit=False,
+        elapsed_ms=elapsed,
+        source="stream",
+    ))
+
     yield evt_complete(node, {
         **output_dict,
         "fhir_conditions": fhir_conditions,
@@ -252,54 +288,6 @@ def _diagnosis_output_to_dict(output) -> dict:
         "high_suspicion_sepsis":    output.high_suspicion_sepsis,
         "requires_isolation":       output.requires_isolation,
     }
-
-from shared.models import DiagnosisOutput, NextStep
-
-def _parse_llm_response(full_response: str, diagnosis_rag) -> "DiagnosisOutput | None":
-    """
-    Parse the raw LLM text output into a DiagnosisOutput.
-    Tries structured parsing first, then raw JSON fallback.
-    """
-    import re, json
-    from rag import _validate_and_repair_items
-
-    text = full_response.strip()
-    # Strip markdown fences
-    text = re.sub(r"```(?:json)?", "", text).strip().rstrip("```").strip()
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # Try to extract JSON object from the response
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group())
-        except json.JSONDecodeError:
-            return None
-
-    if "differential_diagnosis" in data:
-        data["differential_diagnosis"] = _validate_and_repair_items(
-            data["differential_diagnosis"]
-        )
-
-    # Coerce recommended_next_steps strings → NextStep objects
-    if "recommended_next_steps" in data:
-        steps = []
-        for s in data["recommended_next_steps"]:
-            if isinstance(s, str):
-                steps.append(NextStep(category="INVESTIGATION",
-                                      description=s, urgency="routine"))
-            elif isinstance(s, dict):
-                steps.append(NextStep(**s))
-        data["recommended_next_steps"] = steps
-
-    try:
-        return DiagnosisOutput(**data)
-    except Exception:
-        return None
-
 
 @router.post("/stream")
 async def stream_diagnose(request: StreamDiagnoseRequest):

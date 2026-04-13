@@ -45,7 +45,7 @@ router = APIRouter()
 # Import helpers from the main module (works because main.py adds itself to path)
 # These are the same functions used by /fetch — no duplication.
 
-from help import (
+from agents.patient_context.utils import (
     fetch_fhir_resource,
     normalize_patient,
     normalize_conditions,
@@ -60,6 +60,10 @@ from shared.redis_client import redis_client
 from shared.models import PatientState
 from datetime import datetime
 from pydantic import ValidationError
+
+# at the top of stream_endpoint.py, add to existing imports:
+import uuid
+from db import save_patient_context, PatientContextRecord
 
 
 # ── Request body (mirrored from main.py) ──────────────────────────────────────
@@ -165,12 +169,33 @@ async def _stream_fetch(
                         fatal=True)
         return
 
+    elapsed = timer.elapsed_ms()
+
     try:
         conditions              = normalize_conditions(conditions_bundle)
         medications             = normalize_medications(medications_bundle)
         allergies               = normalize_allergies(allergies_bundle)
         labs                    = normalize_observations(observations_bundle)
         diagnostic_reports, img = normalize_diagnostic_reports(diagnostic_reports_bundle)
+
+    # ── Persist to DB (non-fatal — mirrors /fetch) ─────────────────────────────
+        request_id = str(uuid.uuid4())[:8]
+        await save_patient_context(PatientContextRecord(
+            request_id=request_id,
+            patient_id=patient_id,
+            source=source,
+            fhir_base_url=fhir_base_url,
+            fhir_resources_fetched=6,
+            demographics=demographics.model_dump() if demographics else None,
+            active_conditions=[c.model_dump() for c in conditions],
+            medications=[m.model_dump() for m in medications],
+            allergies=[a.model_dump() for a in allergies],
+            lab_results=[l.model_dump() for l in labs],
+            diagnostic_reports=[d.model_dump() for d in diagnostic_reports],
+            imaging_available=img,
+            cache_hit=False,
+            fetch_time_ms=elapsed,
+        ))
 
         patient_state = PatientState(
             patient_id=patient_id,
@@ -191,7 +216,6 @@ async def _stream_fetch(
     # ── Cache ──────────────────────────────────────────────────────────────────
     await redis_client.set_json(cache_key, patient_state.model_dump(), ttl=600)
 
-    elapsed = timer.elapsed_ms()
     yield evt_status(node, "Patient data ready ✓", step=4, total=4)
     yield evt_complete(node, {
         "patient_state": patient_state.model_dump(),
