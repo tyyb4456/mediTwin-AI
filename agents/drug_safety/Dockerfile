@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir --timeout=300 \
     pydantic \
     pydantic-settings \
     httpx \
+    asyncpg \
     "redis[hiredis]" \
     langchain \
     langchain-google-genai \

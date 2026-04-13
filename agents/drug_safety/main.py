@@ -1,5 +1,5 @@
 """
-Agent 4: Drug Safety MCP Server — v2.0
+Agent 4: Drug Safety MCP Server — v2.1
 Port: 8004
 
 DUAL PURPOSE:
@@ -8,15 +8,12 @@ DUAL PURPOSE:
 
   2. A2A component inside MediTwin — Orchestrator calls /check-safety (REST)
 
-CHANGES IN v2.0:
-  - All LLM calls use llm.with_structured_output(PydanticModel) — no more JsonOutputParser
-  - FDA black box warnings fetched and integrated into safety pipeline
-  - LLM enriches interactions with mechanism, monitoring params, management strategy
-  - LLM generates patient-specific risk profile synthesizing ALL safety signals
-  - suggest_alternatives MCP tool is now properly async end-to-end
-  - Rich structured response includes patient_risk_profile and enriched_interactions
-  - Renal/hepatic impairment detection from conditions informs LLM context
-  - FHIR MedicationRequest output includes priority and AI extension
+CHANGES IN v2.1 (over v2.0):
+  - DB persistence via asyncpg (mirrors diagnosis / lab_analysis pattern)
+  - History endpoints at /history/* (same CRUD as other agents)
+  - /stream endpoint now streams LLM tokens for both enrichment phases
+  - /check-safety persists results to drug_safety_results table
+  - Lifespan wires db.init() / db.close()
 
 Architecture:
   FastMCP (stateless HTTP) mounted at /mcp/
@@ -28,20 +25,22 @@ Safety pipeline order (all runs in parallel where possible):
   2. External API: RxNav interaction check + FDA warnings fetch (concurrent)
   3. Determine preliminary safety_status from deterministic findings
   4. LLM enrichment: interaction clinical context + patient risk profile (concurrent, additive)
-  5. Assemble final response
+  5. Assemble final response + persist to DB
 """
 import os
 import sys
 import json
+import uuid
 import asyncio
 from typing import Optional, Annotated
+from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from stream_endpoints import drug_router as stream_router
-        
+
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -58,6 +57,10 @@ from safety_core import (
     generate_patient_risk_profile,
     build_fhir_medication_request,
 )
+
+import db
+from db import init as db_init, close as db_close, save_drug_safety, DrugSafetyRecord
+from history_router import router as history_router
 
 
 # ── Redis cache setup ─────────────────────────────────────────────────────────
@@ -109,11 +112,13 @@ async def cache_set(key: str, value: dict, ttl: int = 3600):
 async def _run_full_safety_check(
     proposed_medications: list[str],
     current_medications: list[str],
-    patient_allergies: list[dict],   # [{substance, reaction, severity}]
-    active_conditions: list[dict],   # [{code, display}]
+    patient_allergies: list[dict],
+    active_conditions: list[dict],
     patient_id: str = "unknown",
-    patient_state: Optional[dict] = None,   # Full PatientState for LLM enrichment
+    patient_state: Optional[dict] = None,
     enrich_with_llm: bool = True,
+    persist: bool = True,           # NEW — set False from MCP tools (no patient_id context)
+    source: str = "check-safety",  # NEW — "check-safety" | "mcp"
 ) -> dict:
     """
     Full drug safety pipeline.
@@ -132,23 +137,20 @@ async def _run_full_safety_check(
       4a. Clinical interaction enrichment (mechanism, monitoring, management)
       4b. Patient-specific risk profile (synthesizes all signals)
 
-    Phase 5 — Assemble response
+    Phase 5 — Assemble response + persist to DB
     """
     all_drugs = proposed_medications + current_medications
-    # Cache key: drug combo + allergies (LLM enrichment NOT cached — patient-specific)
     cache_key = (
         f"drug_safety_v2:"
         f"{':'.join(sorted(all_drugs))}:"
         f"{':'.join(sorted(a.get('substance','') for a in patient_allergies))}"
     )
 
-    # Only cache the non-LLM parts (deterministic + external API results)
     base_cached = await cache_get(cache_key)
-
     if base_cached and not enrich_with_llm:
         print("  ✓ Full cache hit")
         return base_cached
-# rxnav_interactions 
+
     # ── Phase 1: Deterministic local checks ──────────────────────────────────
     print("  Phase 1: Running deterministic safety checks...")
     contraindications = []
@@ -176,7 +178,7 @@ async def _run_full_safety_check(
     if len(all_drugs) >= 2:
         rxcui_map, fda_warnings = await asyncio.gather(
             get_rxcuis_batch(all_drugs),
-            get_fda_warnings_batch(proposed_medications),  # Only check proposed drugs
+            get_fda_warnings_batch(proposed_medications),
         )
         rxcuis = [v for v in rxcui_map.values() if v]
         if len(rxcuis) >= 2:
@@ -208,13 +210,12 @@ async def _run_full_safety_check(
     else:
         safety_status = "SAFE"
 
-    # ── Phase 4: LLM enrichment (concurrent, non-blocking) ───────────────────
+    # ── Phase 4: LLM enrichment ───────────────────────────────────────────────
     enriched_interactions = None
     patient_risk_profile = None
-    interaction_enrichment = None   # ← ADD THIS LINE
-    risk_profile = None      # ← ADD THIS LINE
+    interaction_enrichment = None
+    risk_profile = None
 
-    # Build a minimal patient_state if not provided (for LLM context)
     _patient_ctx = patient_state or {
         "demographics": {"age": "unknown", "gender": "unknown"},
         "active_conditions": active_conditions,
@@ -276,8 +277,38 @@ async def _run_full_safety_check(
                     "time_to_onset":         enrichment.time_to_onset,
                 }
 
+    interaction_risk_narrative = (
+        interaction_enrichment.overall_risk_narrative
+        if interaction_enrichment else None
+    )
+
+    # ── DB persistence ────────────────────────────────────────────────────────
+    request_id = str(uuid.uuid4())[:8]
+    if persist:
+        await save_drug_safety(
+            DrugSafetyRecord(
+                request_id=request_id,
+                patient_id=patient_id,
+                proposed_medications=proposed_medications,
+                current_medications=current_medications,
+                safety_status=safety_status,
+                contraindications=contraindications,
+                approved_medications=approved,
+                flagged_medications=flagged,
+                critical_interactions=enriched_rxnav,
+                fda_warnings=fda_warnings,
+                patient_risk_profile=patient_risk_profile,
+                interaction_risk_narrative=interaction_risk_narrative,
+                fhir_medication_requests=fhir_medication_requests,
+                llm_enriched=enrich_with_llm and risk_profile is not None,
+                cache_hit=False,
+                source=source,
+            )
+        )
+
     result = {
         "safety_status": safety_status,
+        "request_id": request_id,
 
         # Core safety findings (deterministic)
         "contraindications":       contraindications,
@@ -294,27 +325,24 @@ async def _run_full_safety_check(
 
         # LLM-generated patient-specific assessment
         "patient_risk_profile": patient_risk_profile,
-        "interaction_risk_narrative": (
-            interaction_enrichment.overall_risk_narrative
-            if interaction_enrichment else None
-        ),
+        "interaction_risk_narrative": interaction_risk_narrative,
 
         # Summary counts
         "summary": {
-            "proposed_count":       len(proposed_medications),
-            "approved_count":       len(approved),
-            "flagged_count":        len(flagged),
-            "interaction_count":    len(rxnav_interactions),
+            "proposed_count":         len(proposed_medications),
+            "approved_count":         len(approved),
+            "flagged_count":          len(flagged),
+            "interaction_count":      len(rxnav_interactions),
             "contraindication_count": len(contraindications),
-            "black_box_warnings":   sum(
+            "black_box_warnings":     sum(
                 1 for w in fda_warnings.values()
                 if any("[BLACK BOX]" in x for x in w)
             ),
-            "llm_enriched":         enrich_with_llm and patient_risk_profile is not None,
+            "llm_enriched": enrich_with_llm and patient_risk_profile is not None,
         },
     }
 
-    # Cache the base result (without LLM — patient-specific profiles shouldn't be cached)
+    # Cache the base result (without patient-specific LLM profile)
     base_result = {k: v for k, v in result.items()
                    if k not in ("patient_risk_profile", "interaction_risk_narrative")}
     await cache_set(cache_key, base_result, ttl=3600)
@@ -368,7 +396,6 @@ async def check_drug_interactions(
 
     interactions = await check_drug_interactions_by_name(medications)
 
-    # LLM enrichment — build minimal patient context
     minimal_state = {
         "demographics": {"age": "unknown", "gender": "unknown"},
         "active_conditions": [],
@@ -428,7 +455,6 @@ async def get_contraindications(
     ]
     condition_dicts = [{"code": c, "display": c} for c in (conditions or [])]
 
-    # Run local checks + FDA warning fetch concurrently
     allergy_contras, condition_contras, fda_w = await asyncio.gather(
         asyncio.to_thread(check_allergy_cross_reactivity, drug_name, allergy_dicts),
         asyncio.to_thread(check_condition_contraindications, drug_name, condition_dicts),
@@ -512,13 +538,13 @@ async def suggest_alternatives(
         }
 
     return {
-        "drug_to_replace":     drug_name,
+        "drug_to_replace":      drug_name,
         "reason_for_avoidance": reason_for_avoidance,
-        "indication":          indication,
-        "alternatives":        [a.model_dump() for a in result.alternatives],
-        "clinical_note":       result.clinical_note,
-        "urgency":             result.urgency,
-        "source":              "LLM Clinical Pharmacist (Gemini 2.5 Flash)",
+        "indication":           indication,
+        "alternatives":         [a.model_dump() for a in result.alternatives],
+        "clinical_note":        result.clinical_note,
+        "urgency":              result.urgency,
+        "source":               "LLM Clinical Pharmacist (Gemini 2.5 Flash)",
     }
 
 
@@ -557,8 +583,21 @@ class SafetyCheckRequest(BaseModel):
 
 rest_app = FastAPI(
     title="MediTwin Drug Safety Agent",
-    description="Drug Safety MCP Server (v2.0) + REST API. LLM-enriched safety pipeline.",
-    version="2.0.0",
+    description="Drug Safety MCP Server (v2.1) + REST API. LLM-enriched safety pipeline with DB persistence.",
+    version="2.1.0",
+)
+
+rest_app.include_router(stream_router)
+rest_app.include_router(history_router, prefix="/history", tags=["history"])
+
+from fastapi.middleware.cors import CORSMiddleware
+
+rest_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -575,6 +614,7 @@ async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
       5. LLM interaction enrichment (structured Pydantic output)
       6. LLM patient risk profile (structured Pydantic output)
       7. FHIR MedicationRequest generation for cleared drugs
+      8. DB persistence (non-fatal)
     """
     result = await _run_full_safety_check(
         proposed_medications=request.proposed_medications,
@@ -584,6 +624,8 @@ async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
         patient_id=request.patient_id,
         patient_state=request.patient_state,
         enrich_with_llm=request.enrich_with_llm,
+        persist=True,
+        source="check-safety",
     )
     return JSONResponse(content=result)
 
@@ -592,29 +634,43 @@ async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
 async def health() -> JSONResponse:
     r = await get_redis()
     return JSONResponse(content={
-        "status":        "healthy",
-        "agent":         "drug-safety",
-        "version":       "2.0.0",
-        "redis":         "connected" if r else "disconnected",
-        "mcp_tools":     ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
-        "mcp_endpoint":  "/mcp/",
-        "rest_endpoint": "/check-safety",
-        "llm_model":     "gemini-2.5-flash (structured output via .with_structured_output())",
-        "external_apis": ["NLM RxNav", "NLM RxNorm", "FDA OpenFDA"],
+        "status":          "healthy",
+        "agent":           "drug-safety",
+        "version":         "2.1.0",
+        "redis":           "connected" if r else "disconnected",
+        "db":              "connected" if db.is_available() else "disconnected",
+        "mcp_tools":       ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
+        "mcp_endpoint":    "/mcp/",
+        "rest_endpoint":   "/check-safety",
+        "stream_endpoint": "/stream",
+        "history_prefix":  "/history",
+        "llm_model":       "gemini-2.5-flash (structured output + token streaming)",
+        "external_apis":   ["NLM RxNav", "NLM RxNorm", "FDA OpenFDA"],
         "local_databases": ["cross_reactivity_table", "contraindications.json"],
         "pipeline_phases": [
             "1. Allergy cross-reactivity (deterministic)",
             "2. Condition contraindications (deterministic)",
             "3. RxNav interactions (async API)",
             "4. FDA warnings (async API, concurrent)",
-            "5. LLM interaction enrichment (structured output)",
-            "6. LLM patient risk profile (structured output)",
+            "5. LLM interaction enrichment (streamed tokens + structured output)",
+            "6. LLM patient risk profile (streamed tokens + structured output)",
             "7. FHIR MedicationRequest assembly",
+            "8. DB persistence (asyncpg, non-fatal)",
         ],
     })
 
 
 # ── Mount MCP + REST into unified ASGI app ───────────────────────────────────
+# IMPORTANT: Starlette strips FastAPI sub-app lifespans when mounting.
+# The lifespan MUST live on the top-level Starlette app that uvicorn runs.
+
+@asynccontextmanager
+async def _lifespan(app: Starlette):
+    """Top-level lifespan — runs DB init/close for the combined Starlette app."""
+    await db_init()
+    yield
+    await db_close()
+
 
 mcp_asgi = mcp.streamable_http_app()
 
@@ -622,10 +678,9 @@ combined_app = Starlette(
     routes=[
         Mount("/mcp", app=mcp_asgi),
         Mount("/",    app=rest_app),
-    ]
+    ],
+    lifespan=_lifespan,
 )
-
-rest_app.include_router(stream_router)
 
 
 if __name__ == "__main__":
