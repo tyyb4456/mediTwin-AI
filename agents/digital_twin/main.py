@@ -48,6 +48,7 @@ from model import (
 )
 from clinical_tools import (
     check_drug_guideline_adherence,
+    check_allergy_contraindications,
     CLINICAL_GUIDELINES,
     perform_sensitivity_analysis,
     analyze_cost_effectiveness,
@@ -149,7 +150,7 @@ async def lifespan(app: FastAPI):
                 max_output_tokens=2048,
             )
             _llm_ready = True
-            print("✓ Digital Twin: LLM narrative ready (Gemini 2.0 Flash)")
+            print("✓ Digital Twin: LLM narrative ready (Gemini 2.5 Flash Lite)")
         except Exception as e:
             print(f"⚠️  Digital Twin: LLM init failed ({e}) — narrative disabled")
     else:
@@ -184,22 +185,33 @@ app.include_router(stream_router)
 def predict_with_uncertainty(
     model: xgb.XGBClassifier,
     feature_vector: List[float],
-    n_bootstrap: int = 100,
+    n_bootstrap: int = 200,
 ) -> Tuple[float, float, float]:
     """
-    Bayesian-inspired uncertainty quantification via bootstrap feature perturbation.
+    Uncertainty quantification via bootstrap feature perturbation.
+    Uses per-feature scaled noise (std = 5% of each feature's value, min 0.01)
+    so that all features are perturbed proportionally regardless of scale.
     Returns: (point_estimate, lower_95ci, upper_95ci)
     """
     X = np.array([feature_vector], dtype=np.float32)
     point_est = float(model.predict_proba(X)[0][1])
 
-    bootstrap_preds = [
-        float(model.predict_proba(X + np.random.normal(0, 0.05, X.shape))[0][1])
-        for _ in range(n_bootstrap)
-    ]
+    fv = np.array(feature_vector, dtype=np.float32)
+    # Per-feature noise scale: 5% of absolute value, floored at 0.01
+    noise_scale = np.maximum(np.abs(fv) * 0.05, 0.01)
+
+    rng = np.random.default_rng(42)
+    bootstrap_preds = []
+    for _ in range(n_bootstrap):
+        noise = rng.normal(0, noise_scale, fv.shape).astype(np.float32)
+        X_perturbed = (fv + noise).reshape(1, -1)
+        bootstrap_preds.append(float(model.predict_proba(X_perturbed)[0][1]))
 
     lower = float(np.percentile(bootstrap_preds, 2.5))
     upper = float(np.percentile(bootstrap_preds, 97.5))
+    # Ensure point estimate is contained within CI
+    lower = min(lower, point_est)
+    upper = max(upper, point_est)
     return point_est, lower, upper
 
 
@@ -372,19 +384,51 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
                 "upper_bound_95ci": min(1.0, point + width / 2),
             }
 
-        # Guideline adherence
+        # Guideline adherence — check ALL drugs, not just first
         guideline_adherence = None
         if _tools_ready and diagnosis_code and opt.drugs:
             try:
-                guideline_adherence = check_drug_guideline_adherence.invoke({
-                    "diagnosis_code": diagnosis_code,
-                    "proposed_drug": opt.drugs[0],
-                })
+                # Check each drug; surface the most clinically significant result
+                adherence_results = []
+                for drug in opt.drugs:
+                    result = check_drug_guideline_adherence.invoke({
+                        "diagnosis_code": diagnosis_code,
+                        "proposed_drug": drug,
+                    })
+                    adherence_results.append({**result, "drug": drug})
+                # Prioritise: OFF_GUIDELINE > UNKNOWN > SECOND_LINE > INPATIENT > FIRST_LINE
+                priority = {"OFF_GUIDELINE": 0, "UNKNOWN": 1, "SECOND_LINE": 2,
+                            "INPATIENT_APPROPRIATE": 3, "FIRST_LINE": 4}
+                adherence_results.sort(key=lambda r: priority.get(r.get("adherence", "UNKNOWN"), 1))
+                guideline_adherence = adherence_results  # return full list for transparency
             except Exception as e:
                 print(f"  ⚠️  Guideline check failed: {e}")
 
+        # Allergy & drug-interaction safety check
+        safety_check = None
+        if _tools_ready:
+            try:
+                allergies = patient_state.get("allergies", [])
+                current_meds = patient_state.get("medications", [])
+                safety_check = check_allergy_contraindications.invoke({
+                    "proposed_drugs": opt.drugs + opt.interventions,
+                    "allergies": allergies,
+                    "current_medications": current_meds,
+                })
+            except Exception as e:
+                print(f"  ⚠️  Safety check failed: {e}")
+
         # Key risk flags
         key_risks: List[str] = []
+
+        # 🚨 Safety alerts first — highest priority
+        if safety_check:
+            for alert in safety_check.get("allergy_alerts", []):
+                key_risks.append(f"🚨 {alert['alert']}")
+            for interaction in safety_check.get("interaction_alerts", []):
+                key_risks.append(f"⚠️  DDI: {interaction['warning']} "
+                                 f"({interaction['proposed_drug']} ↔ {interaction['existing_drug']})")
+
         if predictions["mortality_risk_30d"] > 0.10:
             ci = predictions_with_ci["mortality_risk_30d"]
             key_risks.append(
@@ -393,8 +437,10 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             )
         if predictions["readmission_risk_30d"] > 0.20:
             key_risks.append(f"Readmission risk: {predictions['readmission_risk_30d']:.0%}")
-        if guideline_adherence and guideline_adherence.get("adherence") == "OFF_GUIDELINE":
-            key_risks.append("⚠️  Off-guideline treatment")
+        if guideline_adherence:
+            for g in (guideline_adherence if isinstance(guideline_adherence, list) else [guideline_adherence]):
+                if g.get("adherence") == "OFF_GUIDELINE":
+                    key_risks.append(f"⚠️  Off-guideline: {g.get('drug', '')} — {g.get('message', '')}")
         if not key_risks:
             key_risks.append("Low overall risk with this treatment")
 
@@ -407,13 +453,35 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             "predictions_with_ci": predictions_with_ci,
             "key_risks": key_risks,
             "guideline_adherence": guideline_adherence,
+            "safety_check": safety_check,
             "estimated_cost_usd": opt.estimated_cost_usd,
         })
 
     # 6. Select recommended option (exclude baseline "C")
+    # Honour patient_preferences: if patient prefers cost-minimization, apply it
+    patient_prefs = request.patient_preferences or {}
+    prioritize_cost = patient_prefs.get("prioritize_cost", False)
+    avoid_hospitalization = patient_prefs.get("avoid_hospitalization", False)
+
     scoreable = [s for s in scenarios if s["option_id"] != "C"]
-    if scoreable:
-        recommended_id, rec_confidence = select_recommended_option(scoreable)
+
+    # Filter out contraindicated options before scoring
+    safe_scoreable = [
+        s for s in scoreable
+        if not (s.get("safety_check") or {}).get("safety_flag") == "CONTRAINDICATED"
+    ]
+    if not safe_scoreable:
+        # All options are contraindicated — still recommend but flag it
+        safe_scoreable = scoreable
+
+    if avoid_hospitalization:
+        non_hosp = [s for s in safe_scoreable
+                    if "hospitalization" not in [i.lower() for i in s.get("interventions", [])]]
+        if non_hosp:
+            safe_scoreable = non_hosp
+
+    if safe_scoreable:
+        recommended_id, rec_confidence = select_recommended_option(safe_scoreable, prioritize_cost=prioritize_cost)
     else:
         recommended_id = scenarios[0]["option_id"] if scenarios else "A"
         rec_confidence = 0.70
@@ -549,4 +617,7 @@ async def get_guidelines(diagnosis_code: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8006)
+    uvicorn.run(app, host="0.0.0.0", port=8006)
+
+
+# guideline_adherence 

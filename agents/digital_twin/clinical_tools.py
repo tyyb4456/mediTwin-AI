@@ -53,7 +53,17 @@ def check_drug_guideline_adherence(diagnosis_code: str, proposed_drug: str) -> d
     Returns:
         Dictionary with guideline adherence status and recommendations
     """
-    guideline = CLINICAL_GUIDELINES.get(diagnosis_code.split(".")[0])
+    # Try full code first (e.g. "J18.9"), then base code (e.g. "J18"), then prefix
+    guideline = (
+        CLINICAL_GUIDELINES.get(diagnosis_code)
+        or CLINICAL_GUIDELINES.get(diagnosis_code.split(".")[0])
+    )
+    if not guideline:
+        # Try prefix match (e.g. "E11" matches "E11.9")
+        for key in CLINICAL_GUIDELINES:
+            if diagnosis_code.startswith(key) or key.startswith(diagnosis_code.split(".")[0]):
+                guideline = CLINICAL_GUIDELINES[key]
+                break
 
     if not guideline:
         return {
@@ -96,7 +106,116 @@ def check_drug_guideline_adherence(diagnosis_code: str, proposed_drug: str) -> d
 
 
 @tool
-def calculate_chadsvasc_score(
+def check_allergy_contraindications(
+    proposed_drugs: List[str],
+    allergies: List[dict],
+    current_medications: List[dict],
+) -> dict:
+    """
+    Check proposed drugs against patient allergies and known drug-drug interactions
+    with existing medications (e.g. Azithromycin + Warfarin → raised INR).
+
+    Args:
+        proposed_drugs: List of drug names being considered
+        allergies: Patient allergy list from patient_state
+        current_medications: Active medication list from patient_state
+
+    Returns:
+        Dict with allergy_alerts, interaction_alerts, and overall safety_flag
+    """
+    # Cross-reactivity map: if patient is allergic to key, flag these drugs
+    CROSS_REACTIVITY: Dict[str, List[str]] = {
+        "penicillin": ["amoxicillin", "ampicillin", "piperacillin", "ceftriaxone",
+                       "cefazolin", "cephalexin", "cefepime"],  # ~1-2% cross-reactivity
+        "sulfa": ["trimethoprim-sulfamethoxazole", "sulfamethoxazole"],
+        "aspirin": ["ibuprofen", "naproxen", "diclofenac", "ketorolac"],
+    }
+
+    # Known drug-drug interactions with existing meds
+    # Format: (proposed_drug_fragment, existing_drug_fragment) → warning
+    DDI_TABLE: List[Tuple[str, str, str]] = [
+        ("azithromycin", "warfarin",   "MAJOR: Azithromycin inhibits CYP3A4 — may significantly raise INR; monitor INR closely"),
+        ("azithromycin", "apixaban",   "MODERATE: Azithromycin may increase apixaban levels"),
+        ("levofloxacin", "warfarin",   "MAJOR: Fluoroquinolones may potentiate warfarin anticoagulation; monitor INR"),
+        ("moxifloxacin", "warfarin",   "MAJOR: Fluoroquinolones may potentiate warfarin anticoagulation; monitor INR"),
+        ("ceftriaxone",  "warfarin",   "MINOR: Limited interaction; routine INR monitoring recommended"),
+        ("metformin",    "contrast",   "MODERATE: Hold metformin 48h before/after iodinated contrast"),
+        ("prednisone",   "warfarin",   "MODERATE: Corticosteroids may increase or decrease INR"),
+        ("doxycycline",  "warfarin",   "MODERATE: May potentiate warfarin; monitor INR"),
+    ]
+
+    allergy_alerts = []
+    interaction_alerts = []
+
+    # Build sets of patient allergens (lowercase)
+    patient_allergens = {a.get("substance", "").lower() for a in allergies}
+    patient_allergen_severities = {
+        a.get("substance", "").lower(): a.get("severity", "unknown")
+        for a in allergies
+    }
+
+    for drug in proposed_drugs:
+        drug_lower = drug.lower()
+
+        # Direct allergy match
+        for allergen in patient_allergens:
+            if allergen in drug_lower or drug_lower in allergen:
+                allergy_alerts.append({
+                    "drug": drug,
+                    "allergen": allergen,
+                    "severity": patient_allergen_severities.get(allergen, "unknown"),
+                    "alert": f"CONTRAINDICATED: Patient has documented {allergen} allergy "
+                             f"({patient_allergen_severities.get(allergen, 'unknown')} severity)",
+                })
+
+        # Cross-reactivity check
+        for allergen, cross_react_drugs in CROSS_REACTIVITY.items():
+            if allergen in patient_allergens:
+                if any(cr in drug_lower for cr in cross_react_drugs):
+                    # Avoid duplicate with direct allergy
+                    if allergen not in drug_lower:
+                        allergy_alerts.append({
+                            "drug": drug,
+                            "allergen": allergen,
+                            "cross_reactivity": True,
+                            "severity": patient_allergen_severities.get(allergen, "unknown"),
+                            "alert": f"CROSS-REACTIVITY RISK: {drug} may cross-react with documented "
+                                     f"{allergen} allergy — verify tolerance before prescribing",
+                        })
+
+        # Drug-drug interaction check against existing medications
+        for existing_med in current_medications:
+            existing_lower = existing_med.get("drug", "").lower()
+            for proposed_frag, existing_frag, warning in DDI_TABLE:
+                if proposed_frag in drug_lower and existing_frag in existing_lower:
+                    interaction_alerts.append({
+                        "proposed_drug": drug,
+                        "existing_drug": existing_med.get("drug"),
+                        "warning": warning,
+                    })
+
+    safety_flag = "SAFE"
+    if any(a.get("severity") in ("severe", "anaphylaxis") for a in allergy_alerts
+           if not a.get("cross_reactivity")):
+        safety_flag = "CONTRAINDICATED"
+    elif allergy_alerts:
+        safety_flag = "ALLERGY_RISK"
+    elif interaction_alerts:
+        safety_flag = "INTERACTION_WARNING"
+
+    return {
+        "allergy_alerts": allergy_alerts,
+        "interaction_alerts": interaction_alerts,
+        "safety_flag": safety_flag,
+        "summary": (
+            f"{len(allergy_alerts)} allergy alert(s), "
+            f"{len(interaction_alerts)} drug-drug interaction(s) detected"
+        ),
+    }
+
+
+@tool
+def calculate_cha2ds2_vasc(
     age: int,
     gender: str,
     has_chf: bool,
@@ -223,8 +342,23 @@ def perform_sensitivity_analysis(
         "comorbidity_count":   {"modifiable": False, "intervention": "Chronic disease management"},
     }
 
-    # Features where lower is better (decrease by 10% to "improve")
+    # Features where lower is better (decrease by 10% = "improve")
     lower_is_better = {"wbc", "crp", "creatinine", "glucose", "critical_lab_count"}
+    # Features where higher is better (increase by 10% = "improve")
+    higher_is_better = {"albumin", "hemoglobin"}
+    # Non-modifiable features: "improve" = younger (lower age), "worsen" = older (higher age)
+    # We define improvement direction explicitly to avoid sign confusion
+    improvement_direction = {
+        "wbc":                "decrease",
+        "crp":                "decrease",
+        "creatinine":         "decrease",
+        "glucose":            "decrease",
+        "critical_lab_count": "decrease",
+        "albumin":            "increase",
+        "hemoglobin":         "increase",
+        "age":                "decrease",  # "improvement" = younger patient (non-modifiable, for reference)
+        "comorbidity_count":  "decrease",
+    }
 
     sensitivity_results = []
 
@@ -235,25 +369,28 @@ def perform_sensitivity_analysis(
         feat_idx = feature_names.index(feat_name)
         baseline_value = feature_vector[feat_idx]
 
-        # 10% improvement
+        direction = improvement_direction.get(feat_name, "decrease")
+
+        # 10% improvement in the clinically correct direction
         improved_vector = feature_vector.copy()
-        if feat_name in lower_is_better:
-            improved_vector[feat_idx] = baseline_value * 0.9
+        if direction == "decrease":
+            improved_vector[feat_idx] = baseline_value * 0.9  # lower = better
         else:
-            improved_vector[feat_idx] = baseline_value * 1.1
+            improved_vector[feat_idx] = baseline_value * 1.1  # higher = better
         improved_pred = model.predict_proba(np.array([improved_vector]))[0][1]
 
-        # 10% worsening
+        # 10% worsening (opposite direction)
         worsened_vector = feature_vector.copy()
-        if feat_name in lower_is_better:
-            worsened_vector[feat_idx] = baseline_value * 1.1
+        if direction == "decrease":
+            worsened_vector[feat_idx] = baseline_value * 1.1  # higher = worse
         else:
-            worsened_vector[feat_idx] = baseline_value * 0.9
+            worsened_vector[feat_idx] = baseline_value * 0.9  # lower = worse
         worsened_pred = model.predict_proba(np.array([worsened_vector]))[0][1]
 
         sensitivity_results.append({
             "feature_name": feat_name,
             "baseline_value": round(baseline_value, 2),
+            "improvement_direction": direction,
             "risk_impact_if_improved_10_percent": {
                 "mortality_30d_change": round((improved_pred - baseline_pred) * 100, 2),
                 "new_risk": round(improved_pred, 3),
@@ -275,37 +412,67 @@ def analyze_cost_effectiveness(scenarios: List[Dict], patient_age: int) -> Dict:
     """
     Incremental cost-effectiveness analysis (ICEA) comparing treatment scenarios.
     Returns cost per QALY gained and cost-effectiveness acceptability.
+
+    QALY model:
+      - Remaining life expectancy discounted at 3% annually (standard health economics)
+      - 30-day mortality risk directly reduces expected life years
+      - Baseline QoL for acute illness = 0.65 (EQ-5D population norms for pneumonia)
+      - Treatment QoL uplift based on recovery probability
+      - Complications reduce QoL by 0.10 per event
     """
     if not scenarios:
         return {}
 
-    life_expectancy_remaining = max(5, 85 - patient_age)
+    DISCOUNT_RATE = 0.03
+    life_expectancy_remaining = max(1, 85 - patient_age)
+
+    # Discounted life years: sum(1/(1+r)^t) for t=1..N
+    discounted_ly = sum(
+        1 / (1 + DISCOUNT_RATE) ** t
+        for t in range(1, life_expectancy_remaining + 1)
+    )
+
     cea_results = []
 
     for scenario in scenarios:
         preds = scenario.get("predictions", {})
 
-        baseline_qol = 0.70
-        recovery_prob = preds.get("recovery_probability_7d", 0.7)
-        treated_qol = baseline_qol + (recovery_prob * 0.15)
+        mortality_risk_30d = preds.get("mortality_risk_30d", 0.05)
+        complication_risk  = preds.get("complication_risk", 0.10)
+        recovery_prob_7d   = preds.get("recovery_probability_7d", 0.70)
 
-        mortality_risk = preds.get("mortality_risk_30d", 0.05)
-        survival_years = life_expectancy_remaining * (1 - mortality_risk)
-        qalys = treated_qol * survival_years
+        # Survival-adjusted discounted life years
+        prob_surviving_30d = 1.0 - mortality_risk_30d
+        survival_adjusted_ly = discounted_ly * prob_surviving_30d
 
-        cost = scenario.get("estimated_cost_usd") or 0
-        if cost == 0:
-            cost = (
-                15_000
-                if "hospitalization" in [i.lower() for i in scenario.get("interventions", [])]
-                else 500
-            )
+        # QoL: baseline pneumonia QoL + recovery uplift - complication penalty
+        baseline_qol   = 0.65
+        recovery_uplift = recovery_prob_7d * 0.20   # max +0.20 if full recovery
+        complication_penalty = complication_risk * 0.10
+        treated_qol = min(0.95, max(0.10, baseline_qol + recovery_uplift - complication_penalty))
+
+        qalys = round(treated_qol * survival_adjusted_ly, 2)
+
+        # Cost: use provided cost, or impute transparently
+        cost = scenario.get("estimated_cost_usd")
+        cost_source = "provided"
+        if cost is None or cost == 0:
+            if "hospitalization" in [i.lower() for i in scenario.get("interventions", [])]:
+                cost = 15_000
+            elif scenario.get("option_id") == "C" and not scenario.get("drugs"):
+                cost = 0   # true no-treatment baseline
+            else:
+                cost = 500
+            cost_source = "imputed"
 
         cea_results.append({
             "option_id": scenario["option_id"],
             "label": scenario["label"],
             "estimated_cost_usd": cost,
-            "estimated_qalys": round(qalys, 2),
+            "cost_source": cost_source,
+            "survival_probability_30d": round(prob_surviving_30d, 3),
+            "quality_of_life_score": round(treated_qol, 3),
+            "estimated_qalys": qalys,
             "cost_per_qaly": round(cost / max(qalys, 0.01), 2) if qalys > 0 else 999_999,
         })
 
@@ -324,9 +491,12 @@ def analyze_cost_effectiveness(scenarios: List[Dict], patient_age: int) -> Dict:
         "scenarios": cea_results,
         "most_cost_effective": cea_results[0]["option_id"] if cea_results else None,
         "threshold_used_usd_per_qaly": 100_000,
+        "discount_rate_used": DISCOUNT_RATE,
         "interpretation": (
-            "Cost-effectiveness analysis comparing total cost vs. quality-adjusted life years gained. "
-            "Standard threshold: $100,000/QALY in US healthcare."
+            "Incremental cost-effectiveness analysis. QALYs discounted at 3% annually. "
+            "Survival-adjusted for 30-day mortality risk. "
+            "Standard threshold: $100,000/QALY in US healthcare. "
+            "Costs marked 'imputed' are estimated — provide actual costs for precise analysis."
         ),
     }
 
@@ -385,7 +555,14 @@ def build_enhanced_llm_narrative(
     scenario_lines = []
     for s in scenarios:
         preds = s.get("predictions", {})
-        guideline = s.get("guideline_adherence", {})
+        guideline_raw = s.get("guideline_adherence", {})
+
+        # guideline_adherence can be a list (multi-drug) or single dict
+        if isinstance(guideline_raw, list):
+            # Use the highest-priority (first after sorting) result for the narrative label
+            guideline = guideline_raw[0] if guideline_raw else {}
+        else:
+            guideline = guideline_raw if guideline_raw else {}
 
         adherence_note = ""
         if guideline:

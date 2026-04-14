@@ -537,81 +537,138 @@ def engineer_features(patient_state: dict) -> Tuple[List[float], Dict]:
 def get_feature_attribution(feature_dict: Dict, baseline_risks: Dict) -> List[Dict]:
     """
     Generate feature importance attribution using clinical knowledge.
-    Moved from main.py to keep feature engineering modular.
-    
-    Returns top features driving risk with human-readable labels.
+    Returns all features that are clinically significant for this patient
+    (not just a hardcoded top-2), sorted by importance score.
     """
-    # This function would ideally use SHAP or model.get_score()
-    # For now, use rule-based clinical importance
-    
     attributions = []
-    
-    # High-risk features
-    if feature_dict.get("age", 0) > 75:
+
+    # ── Risk-increasing features ───────────────────────────────────────────────
+    age = feature_dict.get("age", 0)
+    if age > 75:
         attributions.append({
-            "feature": f"Advanced age ({int(feature_dict['age'])}y)",
-            "contribution": "+0.15",
-            "direction": "increases_risk",
-            "importance_score": 0.85,
+            "feature": f"Advanced age ({int(age)}y)",
+            "contribution": "+0.15", "direction": "increases_risk", "importance_score": 0.85,
         })
-    
+    elif age > 65:
+        attributions.append({
+            "feature": f"Older age ({int(age)}y)",
+            "contribution": "+0.08", "direction": "increases_risk", "importance_score": 0.60,
+        })
+
     if feature_dict.get("wbc", 0) > 15:
         attributions.append({
             "feature": f"Elevated WBC ({feature_dict['wbc']:.1f})",
-            "contribution": "+0.12",
-            "direction": "increases_risk",
-            "importance_score": 0.78,
+            "contribution": "+0.12", "direction": "increases_risk", "importance_score": 0.78,
         })
-    
+
     if feature_dict.get("crp", 0) > 100:
         attributions.append({
             "feature": f"Severe inflammation (CRP {feature_dict['crp']:.0f})",
-            "contribution": "+0.10",
-            "direction": "increases_risk",
-            "importance_score": 0.72,
+            "contribution": "+0.10", "direction": "increases_risk", "importance_score": 0.72,
         })
-    
+    elif feature_dict.get("crp", 0) > 50:
+        attributions.append({
+            "feature": f"Elevated CRP ({feature_dict['crp']:.0f})",
+            "contribution": "+0.06", "direction": "increases_risk", "importance_score": 0.55,
+        })
+
     if feature_dict.get("albumin", 0) < 3.0:
         attributions.append({
-            "feature": f"Malnutrition (Albumin {feature_dict['albumin']:.1f})",
-            "contribution": "+0.08",
-            "direction": "increases_risk",
-            "importance_score": 0.65,
+            "feature": f"Malnutrition/hypoalbuminaemia (Albumin {feature_dict['albumin']:.1f} g/dL)",
+            "contribution": "+0.08", "direction": "increases_risk", "importance_score": 0.65,
         })
-    
+
     if feature_dict.get("creatinine", 0) > 2.0:
         attributions.append({
-            "feature": f"Renal impairment (Cr {feature_dict['creatinine']:.1f})",
-            "contribution": "+0.08",
-            "direction": "increases_risk",
-            "importance_score": 0.65,
+            "feature": f"Renal impairment (Creatinine {feature_dict['creatinine']:.1f} mg/dL)",
+            "contribution": "+0.08", "direction": "increases_risk", "importance_score": 0.65,
         })
-    
+    elif feature_dict.get("creatinine", 0) > 1.3:
+        attributions.append({
+            "feature": f"Mildly elevated creatinine ({feature_dict['creatinine']:.1f} mg/dL)",
+            "contribution": "+0.04", "direction": "increases_risk", "importance_score": 0.45,
+        })
+
+    if feature_dict.get("has_atrial_fibrillation", 0):
+        attributions.append({
+            "feature": "Atrial fibrillation (thromboembolic & rate-control risk)",
+            "contribution": "+0.07", "direction": "increases_risk", "importance_score": 0.68,
+        })
+
+    if feature_dict.get("on_anticoagulant", 0):
+        attributions.append({
+            "feature": "Active anticoagulation (Warfarin — bleeding risk, drug interactions)",
+            "contribution": "+0.06", "direction": "increases_risk", "importance_score": 0.62,
+        })
+
+    if feature_dict.get("has_diabetes", 0):
+        attributions.append({
+            "feature": "Type 2 Diabetes (impaired immunity, delayed wound healing)",
+            "contribution": "+0.06", "direction": "increases_risk", "importance_score": 0.60,
+        })
+
+    if feature_dict.get("has_chf", 0):
+        attributions.append({
+            "feature": "Congestive heart failure",
+            "contribution": "+0.10", "direction": "increases_risk", "importance_score": 0.75,
+        })
+
+    if feature_dict.get("has_ckd", 0):
+        attributions.append({
+            "feature": "Chronic kidney disease (drug dosing adjustment required)",
+            "contribution": "+0.08", "direction": "increases_risk", "importance_score": 0.65,
+        })
+
+    if feature_dict.get("has_copd", 0):
+        attributions.append({
+            "feature": "COPD (respiratory reserve reduced)",
+            "contribution": "+0.07", "direction": "increases_risk", "importance_score": 0.62,
+        })
+
+    if feature_dict.get("critical_lab_count", 0) > 0:
+        attributions.append({
+            "feature": f"Critical lab flags ({int(feature_dict['critical_lab_count'])} value(s))",
+            "contribution": "+0.09", "direction": "increases_risk", "importance_score": 0.70,
+        })
+
+    comorbidity_count = feature_dict.get("comorbidity_count", 0)
+    if comorbidity_count >= 3:
+        attributions.append({
+            "feature": f"High comorbidity burden ({int(comorbidity_count)} conditions)",
+            "contribution": "+0.07", "direction": "increases_risk", "importance_score": 0.63,
+        })
+
     if feature_dict.get("charlson_index", 0) >= 5:
         attributions.append({
-            "feature": f"High comorbidity burden (Charlson {int(feature_dict['charlson_index'])})",
-            "contribution": "+0.12",
-            "direction": "increases_risk",
-            "importance_score": 0.75,
+            "feature": f"High Charlson Comorbidity Index ({int(feature_dict['charlson_index'])})",
+            "contribution": "+0.12", "direction": "increases_risk", "importance_score": 0.75,
         })
-    
+
     if feature_dict.get("frailty_indicator", 0) == 2:
         attributions.append({
             "feature": "Frailty syndrome present",
-            "contribution": "+0.10",
-            "direction": "increases_risk",
-            "importance_score": 0.70,
+            "contribution": "+0.10", "direction": "increases_risk", "importance_score": 0.70,
         })
-    
-    # Protective features
-    if feature_dict.get("age", 100) < 50 and len(attributions) < 5:
+
+    # ── Risk-reducing features ─────────────────────────────────────────────────
+    if feature_dict.get("age", 100) < 50:
         attributions.append({
-            "feature": f"Younger age ({int(feature_dict['age'])}y)",
-            "contribution": "-0.08",
-            "direction": "reduces_risk",
-            "importance_score": 0.60,
+            "feature": f"Younger age ({int(feature_dict['age'])}y — favorable prognosis)",
+            "contribution": "-0.08", "direction": "reduces_risk", "importance_score": 0.60,
         })
-    
-    # Sort by importance and return top 5
+
+    if feature_dict.get("albumin", 0) >= 4.0:
+        attributions.append({
+            "feature": f"Normal albumin ({feature_dict['albumin']:.1f} g/dL — good nutritional status)",
+            "contribution": "-0.05", "direction": "reduces_risk", "importance_score": 0.50,
+        })
+
+    if feature_dict.get("creatinine", 0) <= 1.0:
+        attributions.append({
+            "feature": "Normal renal function (full drug dosing possible)",
+            "contribution": "-0.04", "direction": "reduces_risk", "importance_score": 0.45,
+        })
+
+    # Sort by importance and return all that are relevant (up to 10)
     attributions.sort(key=lambda x: -x["importance_score"])
-    return attributions[:5]
+    return attributions[:10]

@@ -172,7 +172,59 @@ def generate_labels(df: pd.DataFrame) -> dict:
         "readmission_30d": y_readmit,
         "mortality_30d":   y_mort,
         "complication":    y_comp,
+        "readmission_90d": _generate_readmission_90d(df, y_readmit, n),
+        "mortality_1yr":   _generate_mortality_1yr(df, y_mort, n),
     }
+
+
+def _generate_readmission_90d(df: pd.DataFrame, y_readmit_30d: np.ndarray, n: int) -> np.ndarray:
+    """
+    90-day readmission: higher base rate (~35%) than 30d (~20%).
+    Patients who readmit at 30d almost always also count at 90d.
+    """
+    readmit_90d_logit = (
+        -2.6
+        + 0.03  * (df["age"] - 65)
+        + 0.9   * df["has_ckd"]
+        + 1.1   * df["has_chf"]
+        + 0.7   * df["has_copd"]
+        + 0.5   * df["has_diabetes"]
+        + 0.25  * df["comorbidity_count"]
+        + 0.6   * (df["creatinine"] - 1.0).clip(0)
+        + 0.4   * df["critical_lab_count"]
+        + 0.5   * df["on_steroid"]
+        + 0.4   * (df["hemoglobin"] < 10).astype(int)
+        + np.random.normal(0, 0.3, n)
+    )
+    prob = 1 / (1 + np.exp(-readmit_90d_logit))
+    # Ensure 30d readmitters are also 90d readmitters
+    y = (prob > np.random.uniform(0, 1, n)).astype(int)
+    y = np.maximum(y, y_readmit_30d)
+    return y
+
+
+def _generate_mortality_1yr(df: pd.DataFrame, y_mort_30d: np.ndarray, n: int) -> np.ndarray:
+    """
+    1-year mortality: ~15% base rate.
+    30-day non-survivors are by definition also 1-year non-survivors.
+    """
+    mort_1yr_logit = (
+        -3.0
+        + 0.06  * (df["age"] - 65)
+        + 1.1   * df["has_chf"]
+        + 0.8   * df["has_ckd"]
+        + 1.0   * (df["creatinine"] > 2.0).astype(int)
+        + 0.8   * df["critical_lab_count"]
+        + 0.9   * (df["albumin"] < 3.0).astype(int)
+        + 0.6   * (df["wbc"] > 15).astype(int)
+        + 0.5   * df["has_copd"]
+        + np.random.normal(0, 0.4, n)
+    )
+    prob = 1 / (1 + np.exp(-mort_1yr_logit))
+    y = (prob > np.random.uniform(0, 1, n)).astype(int)
+    # 30-day deaths are also 1-year deaths
+    y = np.maximum(y, y_mort_30d)
+    return y
 
 
 def train_and_save_model(
