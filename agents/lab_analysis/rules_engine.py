@@ -156,7 +156,25 @@ def compute_severity_score(classified_labs: List[dict]) -> dict:
     
     # Base scoring
     score += critical_count * 25
-    score += high_low_count * 10
+    WEIGHTS = {
+        "1988-5": 15,  # CRP
+        "6598-7": 20,  # Troponin
+        "2823-3": 20,  # Potassium
+        "2160-0": 15,  # Creatinine
+        "26464-8": 10, # WBC
+    }
+
+    for r in classified_labs:
+        loinc = r["loinc"]
+        value = float(r["value"])
+
+        if r["flag"] in ("HIGH", "LOW"):
+            score += WEIGHTS.get(loinc, 10)
+
+        #  ADD THIS
+        if loinc == "1988-5" and value > 100:
+            score += 10
+            contributors.append("CRP >100 (severe inflammation)")
     
     if critical_count > 0:
         contributors.append(f"{critical_count} critical value(s)")
@@ -220,13 +238,26 @@ def compute_severity_score(classified_labs: List[dict]) -> dict:
     else:
         risk_category = "LOW"
     
+    systems = set()
+
+    for r in classified_labs:
+        loinc = r["loinc"]
+
+        if loinc == "26464-8":
+            systems.add("immune")
+        elif loinc == "1988-5":
+            systems.add("inflammatory")
+        elif loinc == "2345-7":
+            systems.add("metabolic")
+
+    organ_systems_affected = len(systems)
+
     return {
         "score": score,
         "risk_category": risk_category,
         "contributors": contributors,
-        "organ_systems_affected": len(organ_dysfunction)
+        "organ_systems_affected": organ_systems_affected
     }
-
 
 # ── Rapid Change Detection ────────────────────────────────────────────────────
 
@@ -442,12 +473,21 @@ def detect_patterns(classified_labs: list[dict]) -> list[dict]:
         rules_met = sum(1 for rule in rules if rule(labs_by_loinc))
 
         if rules_met >= min_met:
-            triggered_markers = []
-            for lab in classified_labs:
-                if lab["flag"] in ("HIGH", "LOW", "CRITICAL"):
-                    triggered_markers.append(
-                        f"{lab['display']} {lab['flag']} ({lab['value']} {lab['unit']})"
-                    )
+            def get_relevant_loincs(pattern_name):
+                mapping = {
+                    "Bacterial infection markers": ["26464-8", "1988-5", "770-8"],
+                    "Hyperglycemia / Diabetes decompensation": ["2345-7"],
+                    "Acute kidney injury (AKI) markers": ["2160-0"],
+                }
+                return mapping.get(pattern_name, [])
+
+            relevant_loincs = get_relevant_loincs(pattern["name"])
+
+            triggered_markers = [
+                f"{lab['display']} {lab['flag']} ({lab['value']} {lab['unit']})"
+                for lab in classified_labs
+                if lab["loinc"] in relevant_loincs and lab["flag"] != "NORMAL"
+            ]
 
             detected.append({
                 "pattern": pattern["name"],
@@ -472,57 +512,58 @@ def generate_critical_alerts(classified_labs: list[dict]) -> list[dict]:
     alerts = []
 
     for lab in classified_labs:
-        if lab["flag"] != "CRITICAL":
-            continue
-
         loinc = lab["loinc"]
         display = lab["display"]
-        value = lab["value"]
+        value = float(lab["value"])
         unit = lab["unit"]
 
-        # Specific actionable messages per LOINC
-        if loinc == "26464-8":  # WBC
-            if value >= 15.0:
-                message = f"WBC {value} {unit} — extreme leukocytosis. Rule out leukemia. Sepsis workup mandatory: blood cultures x2, lactate."
+        # --- CRITICAL ALERTS ---
+        if lab["flag"] == "CRITICAL":
+            if loinc == "26464-8":
+                if value >= 15.0:
+                    message = f"WBC {value} {unit} — extreme leukocytosis. Rule out leukemia. Sepsis workup mandatory: blood cultures x2, lactate."
+                else:
+                    message = f"WBC {value} {unit} — severe leukocytosis. Sepsis workup recommended."
+            
+            elif loinc == "718-7":
+                message = f"Hemoglobin {value} {unit} — critical anemia. Transfusion consideration."
+            
+            elif loinc == "777-3":
+                message = f"Platelets {value} {unit} — critical thrombocytopenia."
+            
+            elif loinc == "2160-0":
+                message = f"Creatinine {value} {unit} — critical renal impairment."
+            
+            elif loinc == "2823-3":
+                if value > 5.0:
+                    message = f"Potassium {value} {unit} — critical hyperkalemia. Cardiac emergency."
+                else:
+                    message = f"Potassium {value} {unit} — critical hypokalemia."
+            
             else:
-                message = f"WBC {value} {unit} — severe leukocytosis. Sepsis workup recommended: blood cultures before antibiotics."
-        elif loinc == "718-7":  # Hemoglobin
-            message = f"Hemoglobin {value} {unit} — critical anemia. Transfusion threshold consideration. Evaluate for active bleeding."
-        elif loinc == "777-3":  # Platelets
-            message = f"Platelets {value} {unit} — critical thrombocytopenia. High bleeding risk. Avoid invasive procedures. Hematology consult."
-        elif loinc == "2160-0":  # Creatinine
-            message = f"Creatinine {value} {unit} — critical renal impairment. Urgent nephrology consult. Adjust all renally-cleared medications."
-        elif loinc == "2823-3":  # Potassium
-            if value > 5.0:
-                message = f"Potassium {value} {unit} — critical hyperkalemia. Cardiac emergency — obtain EKG immediately. Consider calcium gluconate."
-            else:
-                message = f"Potassium {value} {unit} — critical hypokalemia. Cardiac arrhythmia risk. IV potassium replacement required."
-        elif loinc == "2947-0":  # Sodium
-            if value > 145:
-                message = f"Sodium {value} {unit} — critical hypernatremia. Risk of cerebral dehydration. Gradual correction required."
-            else:
-                message = f"Sodium {value} {unit} — critical hyponatremia. Risk of seizures and cerebral edema. Controlled correction mandatory."
-        elif loinc == "2345-7":  # Glucose
-            if value > 400:
-                message = f"Glucose {value} {unit} — critical hyperglycemia. Evaluate for DKA/HHS. Check blood gases and ketones."
-            else:
-                message = f"Glucose {value} {unit} — critical hypoglycemia. Immediate glucose administration required."
-        elif loinc == "6598-7":  # Troponin
-            message = f"Troponin {value} {unit} — critical elevation. Acute myocardial injury. Cardiology consult. Serial troponins every 3 hours."
-        elif loinc == "2708-6":  # PaO2
-            message = f"PaO2 {value} {unit} — critical hypoxemia. Respiratory failure. Supplemental oxygen or ventilatory support required."
-        else:
-            message = f"{display} {value} {unit} — critical value. Immediate clinical review required."
+                message = f"{display} {value} {unit} — critical value."
 
-        alerts.append({
-            "level": "CRITICAL",
-            "loinc": loinc,
-            "display": display,
-            "value": value,
-            "unit": unit,
-            "message": message,
-            "action_required": True,
-        })
+            alerts.append({
+                "level": "CRITICAL",
+                "loinc": loinc,
+                "display": display,
+                "value": value,
+                "unit": unit,
+                "message": message,
+                "action_required": True,
+            })
+
+        # --- HIGH-RISK ALERT (NEW BLOCK — OUTSIDE CRITICAL) ---
+        if loinc == "1988-5" and value > 100:
+            alerts.append({
+                "level": "HIGH_RISK",
+                "loinc": loinc,
+                "display": display,
+                "value": value,
+                "unit": unit,
+                "message": "CRP >100 — strong indicator of severe bacterial infection / sepsis risk",
+                "action_required": True,
+            })
 
     return alerts
 

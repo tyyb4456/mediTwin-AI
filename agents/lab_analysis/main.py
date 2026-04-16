@@ -133,6 +133,58 @@ async def analyze_labs(request: LabAnalysisRequest) -> LabAnalysisResponse:
     gender = demographics.get("gender", "male")
     lab_results = patient_state.get("lab_results", [])
 
+    lab_results = patient_state.get("lab_results", [])
+
+    if not lab_results:
+        return LabAnalysisResponse(
+            request_id=request_id,
+            lab_summary={
+                "total_results": 0,
+                "abnormal_count": 0,
+                "critical_count": 0,
+                "overall_severity": "UNKNOWN",
+                "status": "NO_DATA"
+            },
+            flagged_results=[],
+            pattern_analysis={
+                "identified_patterns": [],
+                "pattern_interpretation": "No laboratory data available"
+            },
+            diagnosis_confirmation={
+                "proposed_diagnosis": proposed_dx,
+                "proposed_icd10": proposed_icd10,
+                "confirms_top_diagnosis": None,
+                "lab_confidence_boost": 0,
+                "alternative_diagnosis_code": None,
+                "alternative_diagnosis_display": None,
+                "reasoning": "Cannot assess diagnosis without laboratory data"
+            },
+            critical_alerts=[],
+            trend_analysis=None,
+            severity_score={
+                "score": 0,
+                "risk_category": "UNKNOWN",
+                "contributors": [],
+                "organ_systems_affected": 0
+            },
+            clinical_decision_support={
+                "immediate_actions": [],
+                "urgent_actions": [
+                    {
+                        "priority": "URGENT",
+                        "action": "Obtain baseline laboratory tests immediately",
+                        "details": "CBC, CRP, BMP, Lactate",
+                        "timeframe": "Immediate"
+                    }
+                ],
+                "routine_actions": [],
+                "monitoring_plan": [],
+                "consultations_recommended": [],
+                "follow_up_labs": []
+            },
+            llm_interpretation_available=False
+        )
+
     # ── Step 1: Rules engine ───────────────────────────────────────────────────
     classified  = classify_all(lab_results, age, gender)
     abnormal    = [r for r in classified if r["flag"] in ("HIGH", "LOW", "CRITICAL")]

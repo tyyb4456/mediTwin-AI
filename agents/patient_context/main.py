@@ -282,19 +282,21 @@ async def fetch_patient_context(
         )
     try:
         conditions = normalize_conditions(conditions_bundle)
-        medications = normalize_medications(medications_bundle)
+        medications = await normalize_medications(medications_bundle, base_url=fhir_base_url, auth_headers=auth_headers)
         allergies = normalize_allergies(allergies_bundle)
         labs = normalize_observations(observations_bundle)
         diagnostic_reports, imaging_available = normalize_diagnostic_reports(diagnostic_reports_bundle)
 
         import uuid
         request_id = str(uuid.uuid4())[:8]
+        elapsed_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+
         await save_patient_context(PatientContextRecord(
             request_id=request_id,
             patient_id=patient_id,
             source=source,
             fhir_base_url=fhir_base_url,
-            fhir_resources_fetched=6,  # 0 on cache hit
+            fhir_resources_fetched=6,
             demographics=demographics.model_dump() if demographics else None,
             active_conditions=[c.model_dump() for c in conditions],
             medications=[m.model_dump() for m in medications],
@@ -303,7 +305,7 @@ async def fetch_patient_context(
             diagnostic_reports=[r.model_dump() for r in diagnostic_reports],
             imaging_available=imaging_available,
             cache_hit=False,
-            fetch_time_ms=elapsed_ms,
+            fetch_time_ms=elapsed_ms, 
         ))
         
         # Build PatientState
@@ -353,6 +355,21 @@ async def fetch_patient_context(
             detail=f"FHIR normalization error: {str(e)}"
         )
 
+
+@app.delete("/cache/{patient_id}")
+async def clear_patient_cache(patient_id: str) -> dict:
+    """Clear Redis cache for a specific patient"""
+    cache_key = f"patient_state:{patient_id}"
+    deleted = await redis_client.delete(cache_key)
+    
+    if deleted:
+        logger.info(f"Cache cleared: patient={patient_id}")
+        return {"status": "cleared", "patient_id": patient_id}
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cache entry found for patient {patient_id}"
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HEALTH CHECK

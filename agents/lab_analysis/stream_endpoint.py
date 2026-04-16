@@ -74,6 +74,66 @@ async def _lab_stream(
             fatal=False,
         )
 
+    # ── Early exit: no lab data ────────────────────────────────────────────────
+    labs = patient_state.get("lab_results", [])
+    if not labs:
+        proposed_dx    = (diagnosis_output or {}).get("top_diagnosis", "Unknown")
+        proposed_icd10 = (diagnosis_output or {}).get("top_icd10_code", "UNKNOWN")
+
+        empty_result = {
+            "lab_summary": {
+                "total_results":  0,
+                "abnormal_count": 0,
+                "critical_count": 0,
+                "overall_severity": "UNKNOWN",
+                "status": "NO_DATA",
+            },
+            "flagged_results": [],
+            "pattern_analysis": {
+                "identified_patterns":    [],
+                "pattern_interpretation": "No laboratory data available",
+            },
+            "diagnosis_confirmation": {
+                "proposed_diagnosis":            proposed_dx,
+                "proposed_icd10":                proposed_icd10,
+                "confirms_top_diagnosis":        None,
+                "lab_confidence_boost":          0,
+                "alternative_diagnosis_code":    None,
+                "alternative_diagnosis_display": None,
+                "reasoning": "Cannot assess diagnosis without laboratory data",
+            },
+            "critical_alerts": [],
+            "trend_analysis":  None,
+            "severity_score": {
+                "score":                 0,
+                "risk_category":         "UNKNOWN",
+                "contributors":          [],
+                "organ_systems_affected": 0,
+            },
+            "clinical_decision_support": {
+                "immediate_actions": [],
+                "urgent_actions": [
+                    {
+                        "priority":  "URGENT",
+                        "action":    "Obtain baseline laboratory tests immediately",
+                        "details":   "CBC, CRP, BMP, Lactate",
+                        "timeframe": "Immediate",
+                    }
+                ],
+                "routine_actions":           [],
+                "monitoring_plan":           [],
+                "consultations_recommended": [],
+                "follow_up_labs":            [],
+            },
+            "llm_interpretation_available": False,
+            "request_id": request_id,
+            "cache_hit":  False,
+        }
+
+        yield evt_error(node, "No laboratory data provided — returning empty result", fatal=False)
+        yield evt_complete(node, empty_result, elapsed_ms=timer.elapsed_ms())
+        return
+
     # ── Step 1: Rules engine ───────────────────────────────────────────────────
     yield evt_status(node, "Running deterministic rules engine (CRITICAL flags)...",
                      step=1, total=4)
@@ -81,7 +141,6 @@ async def _lab_stream(
     demographics = patient_state.get("demographics", {})
     age    = demographics.get("age", 40)
     gender = demographics.get("gender", "male")
-    labs   = patient_state.get("lab_results", [])
 
     from rules_engine import (
         classify_all, detect_patterns, generate_critical_alerts,

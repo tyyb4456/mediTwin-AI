@@ -59,6 +59,10 @@ class RedisClient:
         """Set JSON value in Redis"""
         await self.set(key, json.dumps(value), ttl)
 
+    async def delete(self, key: str) -> bool:
+        result = await self._client.delete(key)
+        return result > 0
+
 
 # Singleton instance
 redis_client = RedisClient()

@@ -166,6 +166,18 @@ def run_llm_interpretation(
     """
     if not llm_ready or not llm:
         return None
+    
+    if not classified_labs:
+        return LabInterpretation(
+            pattern_interpretation="No laboratory data available.",
+            confirms_top_diagnosis=False,
+            lab_confidence_boost=0.0,
+            reasoning="Cannot assess without labs",
+            clinical_recommendations=[
+                "Obtain baseline labs immediately"
+            ],
+            urgency_level="URGENT",
+        )
 
     abnormal = [r for r in classified_labs if r["flag"] in ("HIGH", "LOW", "CRITICAL")]
     if not abnormal:
@@ -275,6 +287,28 @@ def analyze_trends(
 
     return trends
 
+def sanitize_action(action: str) -> str:
+    unsafe_verbs = ["initiate", "start", "administer", "give"]
+
+    for verb in unsafe_verbs:
+        if action.lower().startswith(verb):
+            return action.replace(verb.capitalize(), "Recommend evaluation for", 1)
+
+    return action
+
+def map_priority(action: str) -> str:
+    a = action.lower()
+
+    if "immediate" in a or "stat" in a:
+        return "STAT"
+    if "antibiotic" in a or "sepsis" in a:
+        return "URGENT"
+    if "imaging" in a or "culture" in a:
+        return "URGENT"
+    if "glucose" in a or "monitor" in a:
+        return "ROUTINE"
+
+    return "ROUTINE"
 
 # ── Clinical Decision Support ─────────────────────────────────────────────────
 
@@ -288,11 +322,13 @@ def generate_clinical_decision_support(
     monitoring_plan = []
     consults_needed = []
 
-    if critical_alerts:
+    true_critical = [a for a in critical_alerts if a["level"] == "CRITICAL"]
+
+    if true_critical:
         recommendations.append({
             "priority": "STAT",
             "action": "Immediate clinical review of critical lab values",
-            "details": f"{len(critical_alerts)} critical value(s) require immediate attention",
+            "details": f"{len(true_critical)} critical value(s) require immediate attention",
             "timeframe": "Within 15 minutes",
         })
 
@@ -329,8 +365,8 @@ def generate_clinical_decision_support(
     if llm_interpretation and llm_interpretation.clinical_recommendations:
         for rec in llm_interpretation.clinical_recommendations:
             recommendations.append({
-                "priority": llm_interpretation.urgency_level,
-                "action": rec,
+                "priority": map_priority(rec),
+                "action": sanitize_action(rec),
                 "details": "AI-generated recommendation based on lab pattern analysis",
                 "timeframe": "Per urgency level",
             })
@@ -368,6 +404,33 @@ def _suggest_follow_up_labs(classified_labs: List[dict], patterns: List[dict]) -
             "loinc": "3094-0",
             "rationale": "Assess BUN:Cr ratio for prerenal vs intrinsic AKI",
             "timing": "Within 6 hours",
+        })
+
+    crp_high = any(r["loinc"] == "1988-5" and r["flag"] in ("HIGH", "CRITICAL") for r in classified_labs)
+
+    if crp_high:
+        suggestions.append({
+            "test": "Repeat CRP",
+            "loinc": "1988-5",
+            "rationale": "Monitor inflammatory response to treatment",
+            "timing": "24-48 hours",
+        })
+
+    infection_pattern = any("infection" in p["pattern"].lower() for p in patterns)
+
+    if infection_pattern:
+        suggestions.append({
+            "test": "Blood cultures",
+            "loinc": "600-7",
+            "rationale": "Identify causative organism before antibiotics",
+            "timing": "Immediate",
+        })
+
+        suggestions.append({
+            "test": "Serum Lactate",
+            "loinc": "2524-7",
+            "rationale": "Assess for sepsis and tissue hypoperfusion",
+            "timing": "Immediate",
         })
 
     return suggestions

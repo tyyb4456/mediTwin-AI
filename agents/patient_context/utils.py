@@ -200,33 +200,138 @@ def normalize_conditions(fhir_bundle: Dict[str, Any]) -> List[Condition]:
     return conditions
 
 
-def normalize_medications(fhir_bundle: Dict[str, Any]) -> List[Medication]:
+async def _resolve_medication_reference(med_ref: Dict[str, Any], base_url: str, auth_headers: Dict[str, Any]) -> str:
     """
-    Extract medications from FHIR Bundle
-    
-    Returns both active and completed medications
+    Resolve a FHIR medicationReference to a human-readable drug name.
+
+    Strategy (in order):
+    1. Use inline `display` field — no network call needed
+    2. Parse the `reference` field (e.g. "Medication/123") and fetch the
+       Medication resource from the FHIR server, then read its name from:
+         a. medicationCodeableConcept.coding[].display
+         b. medicationCodeableConcept.text
+         c. code.coding[].display  (older FHIR layout)
+         d. code.text
+    3. Fall back to "Unknown medication" if everything above fails
+    """
+    # 1. Inline display — fastest path, no fetch needed
+    display = med_ref.get("display", "").strip()
+    if display:
+        return display
+
+    # 2. Follow the reference link
+    ref_str = med_ref.get("reference", "")
+    if not ref_str:
+        return "Unknown medication"
+
+    try:
+        # Handles both relative ("Medication/123") and absolute URLs
+        if ref_str.startswith("http"):
+            url = ref_str
+        else:
+            # e.g. "Medication/abc-123"  →  base_url + "/Medication/abc-123"
+            resource_type, resource_id = ref_str.split("/", 1)
+            med_resource = await fetch_fhir_resource(
+                resource_type, base_url,
+                resource_id=resource_id,
+                auth_headers=auth_headers
+            )
+            # 2a. Try medicationCodeableConcept (common in R4)
+            for coding in med_resource.get("medicationCodeableConcept", {}).get("coding", []):
+                if coding.get("display"):
+                    return coding["display"]
+            text = med_resource.get("medicationCodeableConcept", {}).get("text", "")
+            if text:
+                return text
+            # 2b. Try top-level code (also common)
+            for coding in med_resource.get("code", {}).get("coding", []):
+                if coding.get("display"):
+                    return coding["display"]
+            text = med_resource.get("code", {}).get("text", "")
+            if text:
+                return text
+
+    except Exception as e:
+        logger.warning(f"Could not resolve medicationReference '{ref_str}': {e}")
+
+    return "Unknown medication"
+
+
+async def normalize_medications(
+    fhir_bundle: Dict[str, Any],
+    base_url: str = "https://hapi.fhir.org/baseR4",
+    auth_headers: Optional[Dict[str, Any]] = None,
+) -> List[Medication]:
+    """
+    Extract medications from FHIR Bundle.
+
+    Returns both active and completed medications.
+    Resolves medicationReference → Medication resource when the inline
+    display name is missing, so you never get "Unknown medication" again.
     """
     medications = []
-    
+    auth_headers = auth_headers or {}
+
     if not fhir_bundle.get("entry"):
         return medications
-    
+
     for entry in fhir_bundle.get("entry", []):
         try:
             resource = entry.get("resource", {})
             if resource.get("resourceType") != "MedicationRequest":
                 continue
-            
-            # Extract medication name
+
+            # ── Resolve drug name ────────────────────────────────────────────
+            # DEBUG: log raw medication fields so we can see what FHIR sends
+            logger.info(
+                f"[MED DEBUG] medicationCodeableConcept={resource.get('medicationCodeableConcept')} | "
+                f"medicationReference={resource.get('medicationReference')} | "
+                f"contained={[c.get('resourceType') for c in resource.get('contained', [])]}"
+            )
+
+            # Priority 1 — medicationCodeableConcept
+            # Check coding[].display first, then .text (HAPI often omits coding entirely)
             med_concept = resource.get("medicationCodeableConcept", {})
             coding = med_concept.get("coding", [])
-            
-            if not coding:
-                # Try medicationReference if concept not available
-                med_ref = resource.get("medicationReference", {})
-                drug_name = med_ref.get("display", "Unknown medication")
+            concept_name = (
+                next((c.get("display") for c in coding if c.get("display")), None)
+                or med_concept.get("text", "")
+            )
+            if concept_name:
+                drug_name = concept_name
+
+            # Priority 2 — contained Medication resource (embedded inline by many FHIR servers)
+            elif resource.get("contained"):
+                contained_med = next(
+                    (c for c in resource["contained"] if c.get("resourceType") == "Medication"),
+                    None
+                )
+                if contained_med:
+                    drug_name = ""
+                    for c in contained_med.get("code", {}).get("coding", []):
+                        if c.get("display"):
+                            drug_name = c["display"]
+                            break
+                    if not drug_name:
+                        drug_name = contained_med.get("code", {}).get("text", "")
+                    if not drug_name:
+                        for ingredient in contained_med.get("ingredient", []):
+                            for c in ingredient.get("itemCodeableConcept", {}).get("coding", []):
+                                if c.get("display"):
+                                    drug_name = c["display"]
+                                    break
+                            if drug_name:
+                                break
+                    drug_name = drug_name or "Unknown medication"
+                else:
+                    drug_name = "Unknown medication"
+
+            # Priority 3 — external medicationReference (requires a FHIR fetch)
             else:
-                drug_name = coding[0].get("display", "Unknown medication")
+                med_ref = resource.get("medicationReference", {})
+                drug_name = await _resolve_medication_reference(med_ref, base_url, auth_headers)
+
+            logger.info(f"[MED DEBUG] Resolved drug name → '{drug_name}'")
             
             # Extract dosage
             dosage_instructions = resource.get("dosageInstruction", [])

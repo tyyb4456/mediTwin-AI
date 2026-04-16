@@ -23,24 +23,91 @@ logger = logging.getLogger("meditwin.diagnosis.rag")
 
 COLLECTION_NAME = "medical_knowledge"
 
-SYSTEM_PROMPT = """You are a clinical decision support system performing differential diagnosis.
-You receive retrieved clinical guidelines and patient data.
+SYSTEM_PROMPT = """
+You are a clinical decision support system performing differential diagnosis.
 
-Rules:
-- Every diagnosis must have a valid ICD-10 code
-- Confidence scores must be between 0.0 and 1.0  
-- Reasoning must cite specific patient findings from the data provided
-- Do not hallucinate drug names or lab values — only use what is in the patient data
-- Return 2-4 diagnoses in the differential, most clinically relevant first
+You will receive structured PATIENT DATA and optional clinical context.
+
+STRICT RULES (MUST FOLLOW):
+
+1. DATA GROUNDING
+- Use ONLY information explicitly present in PATIENT DATA
+- DO NOT assume or add symptoms
+- If data is missing → explicitly acknowledge it
+
+2. DIFFERENTIAL REQUIREMENTS
+- Return EXACTLY 3 or 4 diagnoses
+- Rank by likelihood
+- Each diagnosis must include:
+  - ICD-10 code
+  - Confidence (0.0–1.0)
+  - Reasoning tied directly to patient data
+
+3. CONTEXTUAL REASONING (CRITICAL)
+- You MUST consider relationships between:
+  - symptoms
+  - medications
+  - conditions
+- If a patient is already receiving treatment (e.g., antibiotics):
+  - consider:
+    - treatment failure
+    - resistant infection
+    - alternative (non-infectious) diagnoses
+
+4. DIFFERENTIAL BALANCE (CRITICAL)
+- DO NOT return only one category (e.g., all infections)
+- If data is limited:
+  - include at least ONE non-infectious or alternative diagnosis
+
+5. EVIDENCE QUALITY
+- Supporting evidence must be SPECIFIC and meaningful
+- Avoid repeating the same generic symptom (e.g., “fever”) for all diagnoses
+- Use combinations of data (e.g., fever + medication context)
+
+6. UNCERTAINTY HANDLING
+- If labs/vitals are missing:
+  - reduce confidence
+  - explicitly mention uncertainty
+- Avoid overconfident conclusions
+
+7. PRIORITY OF INFORMATION
+- PATIENT DATA is primary
+- CONTEXT is secondary (support only)
+- If conflict → trust PATIENT DATA
+
+8. NO HALLUCINATION
+- DO NOT invent:
+  - symptoms
+  - labs
+  - vitals
+  - history
+
+9. SELF-CHECK (MANDATORY)
+Before final answer:
+- Are all diagnoses supported by DIFFERENT reasoning?
+- Did I use medication context if present?
+- Did I avoid single-cause bias (e.g., all infections)?
+- If not → revise
+
+Return structured output only.
 """
 
-HUMAN_PROMPT = """RETRIEVED CLINICAL GUIDELINES:
+HUMAN_PROMPT = """
+PATIENT_DATA_JSON:
+{patient_json}
+
+RETRIEVED_CONTEXT:
 {context}
 
-PATIENT DATA:
-{patient_data}
+TASK:
+Generate a differential diagnosis strictly based on PATIENT_DATA_JSON.
 
-Return a ranked differential diagnosis based on the above.
+CHECKLIST BEFORE RETURNING:
+- Exactly 3–4 diagnoses
+- Not all diagnoses from same category
+- Medication context is used if present
+- No hallucinated symptoms
+- Confidence reflects missing data
 """
 
 # LLM-only prompt used when ChromaDB is unavailable
@@ -114,6 +181,29 @@ def _validate_and_repair_items(items: list[dict]) -> list[dict]:
         if "icd10_code" in item:
             item["icd10_code"] = _repair_icd10(item["icd10_code"])
     return items
+
+def _validate_no_hallucination(output: DiagnosisOutput, patient_state: dict):
+    """
+    Ensure model did not use symptoms not present in input.
+    """
+    allowed_terms = set()
+
+    # Collect allowed evidence from patient data
+    for cond in patient_state.get("active_conditions", []):
+        allowed_terms.add(cond.get("display", "").lower())
+
+    for lab in patient_state.get("lab_results", []):
+        allowed_terms.add(lab.get("display", "").lower())
+
+    chief = patient_state.get("chief_complaint", "")
+    if chief:
+        allowed_terms.update(chief.lower().split())
+
+    # Check each diagnosis
+    for diag in output.differential_diagnosis:
+        for evidence in diag.supporting_evidence:
+            if evidence.lower() not in allowed_terms:
+                raise ValueError(f"Hallucinated evidence detected: {evidence}")
  
 
 class DiagnosisRAG:
@@ -156,7 +246,7 @@ class DiagnosisRAG:
         @tool(response_format="content_and_artifact")
         def retrieve_clinical_context(query: str):
             """Retrieve clinical guidelines relevant to a patient presentation."""
-            docs = vectorstore.similarity_search(query, k=6)
+            docs = vectorstore.similarity_search(query, k=4)
             serialized = "\n\n---\n\n".join(
                 f"Source: {doc.metadata}\nContent: {doc.page_content}"
                 for doc in docs
@@ -191,62 +281,74 @@ class DiagnosisRAG:
     def rag_available(self) -> bool:
         return self._rag_available
 
-    def _build_patient_query(self, patient_state: dict, chief_complaint: str) -> str:
+    def _build_patient_json(self, patient_state: dict, chief_complaint: str) -> str:
         demographics = patient_state.get("demographics", {})
-        age = demographics.get("age", "unknown")
-        gender = demographics.get("gender", "unknown")
- 
-        conditions = [c.get("display", "") for c in patient_state.get("active_conditions", [])[:5]] or ["None"]
-        medications = [
-            f"{m.get('drug', '')} {m.get('dose', '')} {m.get('frequency', '')}".strip()
-            for m in patient_state.get("medications", [])[:5]
-        ] or ["None"]
-        allergies = [
-            f"{a.get('substance', '')} ({a.get('severity', 'unknown severity')})"
-            for a in patient_state.get("allergies", [])[:5]
-        ] or ["NKDA"]
- 
-        # Separate abnormal vs normal labs for readability
-        abnormal_labs = []
-        normal_labs = []
-        for lab in patient_state.get("lab_results", []):
-            flag = lab.get("flag", "NORMAL")
-            entry = (
-                f"{lab.get('display', '')}: {lab.get('value', '')} {lab.get('unit', '')} "
-                f"[{flag}]"
-            )
-            if flag in ("HIGH", "LOW", "CRITICAL"):
-                abnormal_labs.append(entry)
-            else:
-                normal_labs.append(entry)
- 
-        vitals_section = ""
-        vitals_loincs = {"8310-5", "8867-4", "9279-1", "55284-4", "59408-5"}  # temp, HR, RR, BP, SpO2
-        vitals = [
-            f"{l.get('display')}: {l.get('value')} {l.get('unit')}"
-            for l in patient_state.get("lab_results", [])
-            if l.get("loinc") in vitals_loincs
-        ]
-        if vitals:
-            vitals_section = f"\nVitals: {', '.join(vitals)}"
- 
-        recent_encounters = patient_state.get("recent_encounters", [])
-        encounter_section = ""
-        if recent_encounters:
-            enc = recent_encounters[0]
-            encounter_section = f"\nRecent encounter: {enc.get('type', '')} on {enc.get('date', '')} — {enc.get('reason', '')}"
- 
-        return (
-            f"Patient: {age}-year-old {gender}\n"
-            f"Chief Complaint: {chief_complaint}\n"
-            f"Active Conditions: {', '.join(conditions)}\n"
-            f"Current Medications: {', '.join(medications)}\n"
-            f"Allergies: {', '.join(allergies)}\n"
-            f"ABNORMAL Labs: {', '.join(abnormal_labs) if abnormal_labs else 'None'}\n"
-            f"Normal Labs: {', '.join(normal_labs[:4]) if normal_labs else 'None'}"
-            f"{vitals_section}"
-            f"{encounter_section}"
-        )
+
+        labs = patient_state.get("lab_results", [])
+        vitals_loincs = {"8310-5", "8867-4", "9279-1", "55284-4", "59408-5"}
+
+        structured = {
+            "demographics": {
+                "age": demographics.get("age"),
+                "gender": demographics.get("gender"),
+            },
+            "chief_complaint": chief_complaint,
+
+            "active_conditions": [
+                c.get("display") for c in patient_state.get("active_conditions", [])
+            ],
+
+            "medications": [
+                {
+                    "drug": m.get("drug"),
+                    "dose": m.get("dose"),
+                    "frequency": m.get("frequency"),
+                }
+                for m in patient_state.get("medications", [])
+            ],
+
+            "allergies": [
+                {
+                    "substance": a.get("substance"),
+                    "severity": a.get("severity"),
+                }
+                for a in patient_state.get("allergies", [])
+            ],
+
+            "labs": [
+                {
+                    "name": l.get("display"),
+                    "value": l.get("value"),
+                    "unit": l.get("unit"),
+                    "flag": l.get("flag"),
+                }
+                for l in labs
+            ],
+
+            "vitals": [
+                {
+                    "name": l.get("display"),
+                    "value": l.get("value"),
+                    "unit": l.get("unit"),
+                }
+                for l in labs if l.get("loinc") in vitals_loincs
+            ],
+
+            "recent_encounter": (
+                patient_state.get("recent_encounters", [None])[0]
+                if patient_state.get("recent_encounters")
+                else None
+            ),
+
+            # 🔥 Explicit missing data signals
+            "data_availability": {
+                "has_labs": bool(labs),
+                "has_vitals": any(l.get("loinc") in vitals_loincs for l in labs),
+                "has_history": bool(patient_state.get("recent_encounters")),
+            }
+        }
+
+        return json.dumps(structured, indent=2)
 
     # ── Rule-based adjustments ────────────────────────────────────────────────
  
@@ -335,9 +437,8 @@ class DiagnosisRAG:
                 output.recommended_next_steps.insert(0, NextStep(
                     category="MEDICATION",
                     description=(
-                        f"⚠️  ALLERGY ALERT: {', '.join(removed)} removed from plan — "
-                        f"patient has documented beta-lactam allergy. Use macrolide or "
-                        f"fluoroquinolone alternative."
+                        f"⚠️ Allergy alert: {', '.join(removed)} removed. "
+                        f"Use alternative such as azithromycin or levofloxacin."
                     ),
                     urgency="stat",
                     rationale="Automated allergy safety filter",
@@ -379,7 +480,7 @@ class DiagnosisRAG:
             chain = prompt | self._structured_llm
             output: DiagnosisOutput = chain.invoke({
                 "context": context,
-                "patient_data": patient_query,
+                "patient_json": patient_query,
             })
             return output
         except Exception as e:
@@ -398,7 +499,7 @@ class DiagnosisRAG:
             ("human", HUMAN_PROMPT),
         ])
         chain = prompt | self._llm
-        raw = chain.invoke({"context": context, "patient_data": patient_query})
+        raw = chain.invoke({"context": context, "patient_json": patient_query})
         text = raw.content if hasattr(raw, "content") else str(raw)
  
         # Strip markdown fences
@@ -457,7 +558,7 @@ class DiagnosisRAG:
             return cached
  
         t0 = time.time()
-        patient_query = self._build_patient_query(patient_state, chief_complaint)
+        patient_query = self._build_patient_json(patient_state, chief_complaint)
  
         if self._rag_available:
             logger.info(f"{log_prefix} Running RAG retrieval + Gemini inference")

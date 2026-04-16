@@ -173,7 +173,7 @@ async def _stream_fetch(
 
     try:
         conditions              = normalize_conditions(conditions_bundle)
-        medications             = normalize_medications(medications_bundle)
+        medications             = await normalize_medications(medications_bundle, base_url=fhir_base_url, auth_headers=auth_headers)
         allergies               = normalize_allergies(allergies_bundle)
         labs                    = normalize_observations(observations_bundle)
         diagnostic_reports, img = normalize_diagnostic_reports(diagnostic_reports_bundle)
