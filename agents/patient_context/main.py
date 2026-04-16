@@ -158,6 +158,16 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(stream_router)
 app.include_router(history_router, prefix="/history", tags=["history"])
 
