@@ -106,7 +106,7 @@ async def _stream_diagnose(
 
     # ── Step 2: Build patient query ────────────────────────────────────────────
     yield evt_status(node, "Building clinical patient query...", step=1, total=5)
-    patient_query = diagnosis._build_patient_query(patient_state, chief_complaint)
+    patient_query = diagnosis._build_patient_json(patient_state, chief_complaint)
 
     # ── Step 3: RAG retrieval or fallback ──────────────────────────────────────
     if diagnosis.rag_available:
@@ -158,7 +158,7 @@ async def _stream_diagnose(
 
     try:
         async for event in chain.astream_events(
-            {"context": context, "patient_data": patient_query},
+            {"context": context, "patient_json": patient_query},
             version="v2",
         ):
             kind = event["event"]

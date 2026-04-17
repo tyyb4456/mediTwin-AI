@@ -340,7 +340,7 @@ class DiagnosisRAG:
                 else None
             ),
 
-            # 🔥 Explicit missing data signals
+            # Explicit missing data signals
             "data_availability": {
                 "has_labs": bool(labs),
                 "has_vitals": any(l.get("loinc") in vitals_loincs for l in labs),
