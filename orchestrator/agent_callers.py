@@ -10,6 +10,7 @@ Design rules (from strategy doc):
 """
 import os
 import logging
+import json
 from typing import Optional
 
 import httpx
@@ -43,23 +44,59 @@ async def safe_call(
     Logs all errors to stdout (orchestrator error_log handled by node functions).
     """
     try:
+        from langgraph.config import get_stream_writer
+        writer = get_stream_writer()
+    except (ImportError, RuntimeError):
+        writer = None
+
+    try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 url,
                 json=payload,
                 headers={
                     "Authorization": f"Bearer {INTERNAL_TOKEN}",
                     "Content-Type": "application/json",
+                    "Accept": "text/event-stream"
                 },
-            )
-            response.raise_for_status()
-            return response.json()
+            ) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    logger.error(f"[{name}] HTTP {response.status_code}: {response.text[:200]}")
+                    return None
+                    
+                final_data = None
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                        
+                    if writer:
+                        writer(event)
+                        
+                    evt_type = event.get("type")
+                    if evt_type in ("complete", "result") and "data" in event:
+                        final_data = event["data"]
+
+                return final_data
 
     except httpx.TimeoutException:
         logger.warning(f"[{name}] Timeout after {timeout}s — returning None")
         return None
     except httpx.HTTPStatusError as e:
-        logger.error(f"[{name}] HTTP {e.response.status_code}: {e.response.text[:200]}")
+        try:
+            body = e.response.text[:200]
+        except Exception:
+            body = ""
+        logger.error(f"[{name}] HTTP {e.response.status_code}: {body}")
         return None
     except Exception as e:
         logger.error(f"[{name}] Unexpected error: {e}")
@@ -75,7 +112,7 @@ async def call_patient_context(
 ) -> Optional[dict]:
     result = await safe_call(
         "PatientContext",
-        f"{PATIENT_CONTEXT_URL}/fetch",
+        f"{PATIENT_CONTEXT_URL}/stream",
         {
             "patient_id": patient_id,
             "fhir_base_url": fhir_base_url,
@@ -94,7 +131,7 @@ async def call_diagnosis(
 ) -> Optional[dict]:
     return await safe_call(
         "Diagnosis",
-        f"{DIAGNOSIS_URL}/diagnose",
+        f"{DIAGNOSIS_URL}/stream",
         {
             "patient_state": patient_state,
             "chief_complaint": chief_complaint,
@@ -110,7 +147,7 @@ async def call_lab_analysis(
 ) -> Optional[dict]:
     return await safe_call(
         "LabAnalysis",
-        f"{LAB_ANALYSIS_URL}/analyze-labs",
+        f"{LAB_ANALYSIS_URL}/stream",
         {
             "patient_state": patient_state,
             "diagnosis_agent_output": diagnosis_output,
@@ -144,7 +181,7 @@ async def call_drug_safety(
 
     return await safe_call(
         "DrugSafety",
-        f"{DRUG_SAFETY_URL}/check-safety",
+        f"{DRUG_SAFETY_URL}/stream",
         {
             "proposed_medications": proposed,
             "current_medications": current_meds,
@@ -162,7 +199,7 @@ async def call_imaging(
 ) -> Optional[dict]:
     return await safe_call(
         "ImagingTriage",
-        f"{IMAGING_TRIAGE_URL}/analyze-xray",
+        f"{IMAGING_TRIAGE_URL}/stream",
         {
             "patient_id": patient_state.get("patient_id", "unknown"),
             "image_data": {
@@ -222,7 +259,7 @@ async def call_digital_twin(
 
     return await safe_call(
         "DigitalTwin",
-        f"{DIGITAL_TWIN_URL}/simulate",
+        f"{DIGITAL_TWIN_URL}/stream",
         {
             "patient_state": patient_state,
             "diagnosis": diagnosis_str,
@@ -241,7 +278,7 @@ async def call_consensus(
 ) -> Optional[dict]:
     return await safe_call(
         "Consensus",
-        f"{CONSENSUS_URL}/consensus",
+        f"{CONSENSUS_URL}/stream",
         {
             "diagnosis_output":   diagnosis_output,
             "lab_output":         lab_output,
@@ -265,7 +302,7 @@ async def call_explanation(
 ) -> Optional[dict]:
     return await safe_call(
         "Explanation",
-        f"{EXPLANATION_URL}/explain",
+        f"{EXPLANATION_URL}/stream",
         {
             "patient_state":      patient_state,
             "consensus_output":   consensus_output,
