@@ -204,6 +204,90 @@ async def get_by_request(request_id: str):
 
     return _parse_row(row)
 
+
+@router.get("/stats/{patient_id}", response_model=PatientContextStatsResponse)
+async def get_patient_context_stats(patient_id: str):
+    """
+    Aggregate stats across all fetch sessions for a patient.
+    Useful for frontend patient summary cards and usage analytics.
+    """
+    _db_check()
+
+    async with db._pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM patient_context_results WHERE patient_id = $1",
+            patient_id,
+        )
+
+        if not total:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No records found for patient '{patient_id}'",
+            )
+
+        # Cache breakdown
+        cache_hits = await conn.fetchval(
+            "SELECT COUNT(*) FROM patient_context_results WHERE patient_id = $1 AND cache_hit = TRUE",
+            patient_id,
+        )
+
+        # Source breakdown
+        sharp_sessions = await conn.fetchval(
+            "SELECT COUNT(*) FROM patient_context_results WHERE patient_id = $1 AND source = 'SHARP'",
+            patient_id,
+        )
+
+        # Imaging
+        imaging_sessions = await conn.fetchval(
+            "SELECT COUNT(*) FROM patient_context_results WHERE patient_id = $1 AND imaging_available = TRUE",
+            patient_id,
+        )
+
+        # Averages and peaks
+        agg_row = await conn.fetchrow(
+            """
+            SELECT
+                AVG(fetch_time_ms)      AS avg_fetch_ms,
+                AVG(conditions_count)   AS avg_conditions,
+                AVG(medications_count)  AS avg_medications,
+                AVG(lab_results_count)  AS avg_labs,
+                MAX(conditions_count)   AS peak_conditions,
+                MAX(lab_results_count)  AS peak_labs
+            FROM patient_context_results
+            WHERE patient_id = $1
+            """,
+            patient_id,
+        )
+
+        # Timeline
+        latest = await conn.fetchval(
+            "SELECT MAX(created_at) FROM patient_context_results WHERE patient_id = $1",
+            patient_id,
+        )
+        first = await conn.fetchval(
+            "SELECT MIN(created_at) FROM patient_context_results WHERE patient_id = $1",
+            patient_id,
+        )
+
+    return PatientContextStatsResponse(
+        patient_id=patient_id,
+        total_fetch_sessions=total,
+        cache_hit_sessions=cache_hits or 0,
+        cache_miss_sessions=total - (cache_hits or 0),
+        sharp_sessions=sharp_sessions or 0,
+        direct_sessions=total - (sharp_sessions or 0),
+        imaging_available_sessions=imaging_sessions or 0,
+        avg_fetch_time_ms=round(float(agg_row["avg_fetch_ms"]), 1) if agg_row["avg_fetch_ms"] else None,
+        avg_conditions_count=round(float(agg_row["avg_conditions"]), 1) if agg_row["avg_conditions"] else None,
+        avg_medications_count=round(float(agg_row["avg_medications"]), 1) if agg_row["avg_medications"] else None,
+        avg_lab_results_count=round(float(agg_row["avg_labs"]), 1) if agg_row["avg_labs"] else None,
+        peak_conditions_count=agg_row["peak_conditions"] or 0,
+        peak_lab_results_count=agg_row["peak_labs"] or 0,
+        latest_fetch=str(latest) if latest else None,
+        first_fetch=str(first) if first else None,
+    )
+
+
 @router.delete("/{patient_id}")
 async def delete_patient_context_history(
     patient_id: str,
