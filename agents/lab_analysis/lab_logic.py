@@ -43,8 +43,8 @@ class LabInterpretation(BaseModel):
         description="Does the lab pattern support the proposed diagnosis?"
     )
     lab_confidence_boost: float = Field(
-        ge=0.0, le=0.25,
-        description="How much these labs add to diagnostic confidence (0.0-0.25)"
+        ge=0.0, le=1.0,
+        description="How much these labs add to diagnostic confidence (0.0-1.0)"
     )
     alternative_diagnoses: List[AlternativeDiagnosis] = Field(
         default_factory=list,
