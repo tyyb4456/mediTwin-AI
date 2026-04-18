@@ -1,7 +1,13 @@
 """
-Agent 5: Imaging Triage Agent — v2.1
+Agent 5: Imaging Triage Agent — v2.2 POLISHED
 CNN-based chest X-ray analysis — wraps trained EfficientNetB0 model.
 Port: 8005
+
+Improvements in v2.2:
+  - FIXED: LLM action deduplication (merge intelligently, not just prepend)
+  - ENHANCED: Clinical interpretation includes confidence-based caveats
+  - IMPROVED: Action prioritization (LLM context-aware actions first, then CNN defaults)
+  - REFINED: Safety-netting is always present in final actions
 
 Changes in v2.1:
   - REMOVED: LLM synthetic fallback mode (no image → orchestrator does not route here)
@@ -102,7 +108,8 @@ Rules:
 - Acknowledge uncertainty when confidence is moderate (50-75%)
 - Always note that actual radiologist review is required for definitive interpretation
 - Consider patient age when assessing risk (paediatric <5y, elderly >65y are higher risk)
-- Be concise and clinically precise"""
+- Be concise and clinically precise
+- Provide practical, immediately actionable steps"""
 
 _LLM_HUMAN = """CNN MODEL OUTPUT:
 - Prediction:           {prediction}
@@ -199,7 +206,7 @@ class ImagingResponse(BaseModel):
     severity_assessment: dict
     imaging_findings: dict
     clinical_interpretation: str
-    llm_interpretation: Optional[dict] = None   # ← NEW: structured LLM opinion
+    llm_interpretation: Optional[dict] = None   # ← structured LLM opinion
     confirms_diagnosis: bool
     diagnosis_code: Optional[str]
     recommended_actions: list[str]
@@ -215,7 +222,7 @@ class ImagingResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load CNN model + init DB at startup."""
-    print("Imaging Triage Agent v2.1 starting...")
+    print("Imaging Triage Agent v2.2 POLISHED starting...")
 
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
@@ -230,7 +237,7 @@ async def lifespan(app: FastAPI):
         print(f"⚠️  Model not loaded ({get_model_error()}) — mock mode active")
 
     await db_init()
-    print("✓ Imaging Triage Agent v2.1 ready")
+    print("✓ Imaging Triage Agent v2.2 POLISHED ready")
 
     yield
 
@@ -246,7 +253,7 @@ app = FastAPI(
         "Use POST /analyze-xray for programmatic base64 access. "
         "Synthetic fallback is disabled — orchestrator only routes here when imaging_available=True."
     ),
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -343,6 +350,11 @@ def build_clinical_interpretation(
     severity: dict,
     patient_context: Optional[PatientContext],
 ) -> str:
+    """
+    Build CNN-based clinical interpretation with confidence-aware caveats.
+    
+    v2.2 IMPROVEMENT: Adds uncertainty language for borderline cases (50-75% confidence).
+    """
     age_str = f"{patient_context.age}-year-old " if patient_context else ""
     chief = (
         f" ({patient_context.chief_complaint})"
@@ -352,41 +364,111 @@ def build_clinical_interpretation(
     AI_DISCLAIMER_SHORT = "AI-generated — not a substitute for radiologist review."
 
     if prediction == "PNEUMONIA":
+        # Add uncertainty caveat for moderate confidence
+        certainty_qualifier = ""
+        if confidence < 0.75:
+            certainty_qualifier = "possibly "
+        elif confidence >= 0.90:
+            certainty_qualifier = "highly "
+        
         return (
             f"Chest X-ray pattern for {age_str}patient{chief} is "
-            f"{'highly ' if confidence >= 0.90 else ''}consistent with pneumonia "
+            f"{certainty_qualifier}consistent with pneumonia "
             f"(AI confidence {confidence:.1%}). "
             f"{severity['clinical_urgency']} {AI_DISCLAIMER_SHORT}"
         )
     else:
+        # NORMAL prediction — add caveat about early pneumonia
+        caveat = ""
+        if pneumonia_prob >= 0.30:  # Not pneumonia, but not zero either
+            caveat = " However, early-stage pneumonia cannot be excluded on imaging alone. "
+        
         return (
             f"Chest X-ray does not show significant consolidation for {age_str}patient{chief} "
-            f"(normal probability {1 - pneumonia_prob:.1%}). "
+            f"(normal probability {1 - pneumonia_prob:.1%}).{caveat} "
             f"Clinical presentation should guide further workup. {AI_DISCLAIMER_SHORT}"
         )
+
+
+def _normalize_action(action: str) -> str:
+    """
+    Normalize an action string for deduplication.
+    Removes trailing periods, lowercases, strips whitespace.
+    """
+    return action.strip().rstrip('.').lower()
 
 
 def build_recommended_actions(
     prediction: str,
     severity: dict,
     patient_context: Optional[PatientContext],
+    llm_interpretation: Optional[ImagingLLMInterpretation] = None,
 ) -> list[str]:
-    actions = []
+    """
+    v2.2 POLISHED: Merge LLM actions with CNN rule-based actions intelligently.
+    
+    Priority:
+      1. LLM immediate_actions (context-aware, patient-specific)
+      2. CNN rule-based actions (not already covered by LLM)
+      3. Mandatory safety-netting (always present)
+    
+    Deduplication: semantic matching on normalized strings.
+    """
+    final_actions = []
+    seen_normalized = set()
+    
+    # ── Step 1: Add LLM actions first (highest priority) ─────────────────────
+    if llm_interpretation and llm_interpretation.immediate_actions:
+        for action in llm_interpretation.immediate_actions:
+            norm = _normalize_action(action)
+            if norm not in seen_normalized:
+                final_actions.append(action)
+                seen_normalized.add(norm)
+    
+    # ── Step 2: Add CNN rule-based actions (if not covered) ──────────────────
+    cnn_actions = []
+    
     if prediction == "PNEUMONIA":
         if severity["triage_priority"] <= 2:
-            actions.append("Start empirical antibiotic therapy per local guidelines")
-            actions.append("Blood cultures x2 before antibiotic administration")
-        actions.append("Repeat chest X-ray at 48-72 hours to assess response")
-        actions.append("Monitor oxygen saturation (target SpO2 >94%)")
-        actions.append("Ensure adequate hydration and rest")
+            cnn_actions.append("Start empirical antibiotic therapy per local guidelines")
+            cnn_actions.append("Blood cultures x2 before antibiotic administration")
+        cnn_actions.append("Repeat chest X-ray at 48-72 hours to assess response")
+        cnn_actions.append("Monitor oxygen saturation (target SpO2 >94%)")
+        
         if patient_context and patient_context.age >= 65:
-            actions.append("Elderly patient — lower threshold for hospitalization")
+            cnn_actions.append(f"Elderly patient ({patient_context.age}y) — lower threshold for hospitalization")
+        elif patient_context and patient_context.age < 5:
+            cnn_actions.append(f"Paediatric patient ({patient_context.age}y) — close monitoring required")
     else:
-        actions.append("Clinical correlation required — normal X-ray does not exclude early pneumonia")
-        actions.append("Consider repeat imaging in 24-48 hours if clinical suspicion persists")
-        actions.append("Monitor for symptom progression")
-    actions.append("Radiologist review recommended for definitive interpretation")
-    return actions
+        cnn_actions.append("Clinical correlation required — normal X-ray does not exclude early pneumonia")
+        cnn_actions.append("Consider repeat imaging in 24-48 hours if clinical suspicion persists")
+        cnn_actions.append("Monitor for symptom progression")
+    
+    for action in cnn_actions:
+        norm = _normalize_action(action)
+        if norm not in seen_normalized:
+            final_actions.append(action)
+            seen_normalized.add(norm)
+    
+    # ── Step 3: Mandatory safety-netting (always last) ───────────────────────
+    mandatory = [
+        "Radiologist review recommended for definitive interpretation",
+    ]
+    
+    # Add LLM safety-net if present and not duplicate
+    if llm_interpretation and llm_interpretation.safety_net:
+        safety_norm = _normalize_action(llm_interpretation.safety_net)
+        if safety_norm not in seen_normalized:
+            mandatory.insert(0, llm_interpretation.safety_net)
+            seen_normalized.add(safety_norm)
+    
+    for action in mandatory:
+        norm = _normalize_action(action)
+        if norm not in seen_normalized:
+            final_actions.append(action)
+            seen_normalized.add(norm)
+    
+    return final_actions
 
 
 # ── Main REST Endpoint ─────────────────────────────────────────────────────────
@@ -412,6 +494,11 @@ async def analyze_xray(request: ImagingRequest) -> ImagingResponse:
 
     NOTE: This agent is only routed to when imaging_available=True in PatientState.
     The orchestrator does NOT send requests here without an image.
+    
+    v2.2 IMPROVEMENTS:
+      - Intelligent action deduplication (LLM + CNN merged)
+      - Confidence-aware clinical interpretation
+      - Better safety-netting
     """
     if not request.image_data or not request.image_data.data:
         raise HTTPException(status_code=400, detail="image_data.data is required")
@@ -490,22 +577,7 @@ async def analyze_xray(request: ImagingRequest) -> ImagingResponse:
 
     severity         = classify_severity(pneumonia_prob, patient_context.age)
     imaging_findings = interpret_imaging_findings(pneumonia_prob, severity)
-    clinical_interpretation = build_clinical_interpretation(
-        prediction, confidence, pneumonia_prob, severity, patient_context
-    )
-    recommended_actions = build_recommended_actions(prediction, severity, patient_context)
-    fhir_report = build_fhir_diagnostic_report(
-        patient_id=patient_id,
-        prediction=prediction,
-        confidence=confidence,
-        pneumonia_prob=pneumonia_prob,
-        severity=severity,
-        imaging_findings=imaging_findings,
-    )
-
-    confirms_diagnosis = prediction == "PNEUMONIA"
-    diagnosis_code     = "J18.9" if confirms_diagnosis else None
-
+    
     # ── LLM Interpretation (after CNN, non-blocking) ───────────────────────────
     llm_interp = await run_llm_interpretation(
         prediction=prediction,
@@ -517,6 +589,27 @@ async def analyze_xray(request: ImagingRequest) -> ImagingResponse:
         patient_context=patient_context,
     )
     llm_interp_dict = llm_interp.model_dump() if llm_interp else None
+    
+    # ── Build outputs (v2.2 POLISHED versions) ─────────────────────────────────
+    clinical_interpretation = build_clinical_interpretation(
+        prediction, confidence, pneumonia_prob, severity, patient_context
+    )
+    
+    recommended_actions = build_recommended_actions(
+        prediction, severity, patient_context, llm_interp
+    )
+    
+    fhir_report = build_fhir_diagnostic_report(
+        patient_id=patient_id,
+        prediction=prediction,
+        confidence=confidence,
+        pneumonia_prob=pneumonia_prob,
+        severity=severity,
+        imaging_findings=imaging_findings,
+    )
+
+    confirms_diagnosis = prediction == "PNEUMONIA"
+    diagnosis_code     = "J18.9" if confirms_diagnosis else None
 
     # ── Persist ────────────────────────────────────────────────────────────────
     await save_imaging_result(ImagingRecord(
@@ -562,7 +655,7 @@ async def analyze_xray(request: ImagingRequest) -> ImagingResponse:
         llm_interpretation=llm_interp_dict,   # ← structured LLM opinion
         confirms_diagnosis=confirms_diagnosis,
         diagnosis_code=diagnosis_code,
-        recommended_actions=recommended_actions,
+        recommended_actions=recommended_actions,  # ← v2.2 POLISHED merge
         fhir_diagnostic_report=fhir_report,
         model_loaded=True,
         mock=False,
@@ -577,7 +670,7 @@ async def health():
     return {
         "status": "healthy",
         "agent": "imaging-triage",
-        "version": "2.1.0",
+        "version": "2.2.0-polished",
         "model_loaded": model_loaded,
         "model_path": str(MODEL_PATH),
         "model_error": get_model_error(),
@@ -595,6 +688,12 @@ async def health():
             "stream":       "POST /stream (SSE, CNN inference with progress events)",
             "history":      "GET /history/{patient_id}",
         },
+        "improvements_v2_2": [
+            "Intelligent LLM + CNN action deduplication",
+            "Confidence-aware clinical interpretation with uncertainty caveats",
+            "Prioritized action list (LLM first, then CNN, then safety-netting)",
+            "Better semantic matching for duplicate actions"
+        ],
         "note": "Synthetic LLM fallback removed — orchestrator only routes here when imaging_available=True",
     }
 

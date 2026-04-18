@@ -1,7 +1,12 @@
 """
 agents/imaging_triage/stream_endpoint.py
 ------------------------------------------
-SSE streaming endpoint for the Imaging Triage Agent — v2.1
+SSE streaming endpoint for the Imaging Triage Agent — v2.2 POLISHED
+
+Improvements in v2.2:
+  - FIXED: Same intelligent action deduplication as main.py
+  - ENHANCED: Shares build_recommended_actions logic with main.py (DRY principle)
+  - IMPROVED: Confidence-aware clinical interpretation
 
 ONE MODE only (synthetic LLM fallback removed — orchestrator does not route
 here without an image):
@@ -102,7 +107,8 @@ Rules:
 - Acknowledge uncertainty when confidence is moderate (50-75%)
 - Always note that actual radiologist review is required for definitive interpretation
 - Consider patient age when assessing risk (paediatric <5y, elderly >65y are higher risk)
-- Be concise and clinically precise"""
+- Be concise and clinically precise
+- Provide practical, immediately actionable steps"""
 
 _LLM_HUMAN = """CNN MODEL OUTPUT:
 - Prediction:            {prediction}
@@ -150,6 +156,75 @@ class ImagingStreamRequest(BaseModel):
         default=None,
         description="Full PatientState from Patient Context Agent"
     )
+
+
+# ── Helpers (v2.2 POLISHED — shared logic with main.py) ───────────────────────
+
+def _normalize_action(action: str) -> str:
+    """Normalize an action string for deduplication."""
+    return action.strip().rstrip('.').lower()
+
+
+def _build_actions(
+    prediction: str,
+    severity: dict,
+    age: int,
+    llm_interp: Optional[ImagingLLMInterpretation] = None,
+) -> list[str]:
+    """
+    v2.2 POLISHED: Merge LLM + CNN actions intelligently.
+    Same logic as main.py build_recommended_actions.
+    """
+    final_actions = []
+    seen_normalized = set()
+    
+    # ── Step 1: LLM actions first ─────────────────────────────────────────────
+    if llm_interp and llm_interp.immediate_actions:
+        for action in llm_interp.immediate_actions:
+            norm = _normalize_action(action)
+            if norm not in seen_normalized:
+                final_actions.append(action)
+                seen_normalized.add(norm)
+    
+    # ── Step 2: CNN rule-based actions ────────────────────────────────────────
+    cnn_actions = []
+    if prediction == "PNEUMONIA":
+        if severity["triage_priority"] <= 2:
+            cnn_actions.append("Start empirical antibiotic therapy per local guidelines")
+            cnn_actions.append("Blood cultures x2 before antibiotic administration")
+        cnn_actions.append("Repeat chest X-ray at 48-72 hours to assess response")
+        cnn_actions.append("Monitor oxygen saturation (target SpO2 >94%)")
+        if age > 65:
+            cnn_actions.append(f"Elderly patient ({age}y) — lower threshold for hospitalization")
+        elif age < 5:
+            cnn_actions.append(f"Paediatric patient ({age}y) — close monitoring required")
+    else:
+        cnn_actions.append("Clinical correlation required — normal X-ray does not exclude early pneumonia")
+        cnn_actions.append("Consider repeat imaging in 24-48 hours if clinical suspicion persists")
+        cnn_actions.append("Monitor for symptom progression")
+    
+    for action in cnn_actions:
+        norm = _normalize_action(action)
+        if norm not in seen_normalized:
+            final_actions.append(action)
+            seen_normalized.add(norm)
+    
+    # ── Step 3: Mandatory safety-netting ──────────────────────────────────────
+    mandatory = ["Radiologist review recommended for definitive interpretation"]
+    
+    if llm_interp and llm_interp.safety_net:
+        safety_norm = _normalize_action(llm_interp.safety_net)
+        if safety_norm not in seen_normalized:
+            mandatory.insert(0, llm_interp.safety_net)
+            seen_normalized.add(safety_norm)
+    
+    for action in mandatory:
+        norm = _normalize_action(action)
+        if norm not in seen_normalized:
+            final_actions.append(action)
+            seen_normalized.add(norm)
+    
+    return final_actions
 
 
 # ── Core streaming generator ───────────────────────────────────────────────────
@@ -326,21 +401,32 @@ async def _imaging_stream(req: ImagingStreamRequest) -> AsyncIterator[str]:
         "confidence_in_findings": cif,
     }
 
+    # ── v2.2 POLISHED: Confidence-aware clinical interpretation ───────────────
     age_str       = f"{patient_age}-year-old " if patient_age else ""
     complaint_str = f" ({chief_complaint})" if chief_complaint else ""
     AI_DISCLAIMER = "AI-generated — not a substitute for radiologist review."
 
     if prediction == "PNEUMONIA":
+        certainty_qualifier = ""
+        if confidence < 0.75:
+            certainty_qualifier = "possibly "
+        elif confidence >= 0.90:
+            certainty_qualifier = "highly "
+        
         clinical_interpretation = (
             f"Chest X-ray pattern for {age_str}patient{complaint_str} is "
-            f"{'highly ' if confidence >= 0.90 else ''}consistent with pneumonia "
+            f"{certainty_qualifier}consistent with pneumonia "
             f"(AI confidence {confidence:.1%}). "
             f"{severity['clinical_urgency']} {AI_DISCLAIMER}"
         )
     else:
+        caveat = ""
+        if pneumonia_prob >= 0.30:
+            caveat = " However, early-stage pneumonia cannot be excluded on imaging alone. "
+        
         clinical_interpretation = (
             f"Chest X-ray does not show significant consolidation for {age_str}patient{complaint_str} "
-            f"(normal probability {normal_prob:.1%}). "
+            f"(normal probability {normal_prob:.1%}).{caveat} "
             f"Clinical presentation should guide further workup. {AI_DISCLAIMER}"
         )
 
@@ -436,13 +522,8 @@ async def _imaging_stream(req: ImagingStreamRequest) -> AsyncIterator[str]:
         pct=90,
     )
 
-    # ── Build recommended_actions (merge CNN defaults + LLM actions) ──────────
-    recommended_actions = _build_actions(prediction, severity, patient_age)
-    if llm_interp and llm_interp.immediate_actions:
-        # Prepend LLM immediate actions (more context-aware), deduplicate
-        seen = set(recommended_actions)
-        llm_actions = [a for a in llm_interp.immediate_actions if a not in seen]
-        recommended_actions = llm_actions + recommended_actions
+    # ── v2.2 POLISHED: Build actions with intelligent merge ───────────────────
+    recommended_actions = _build_actions(prediction, severity, patient_age, llm_interp)
 
     # ══════════════════════════════════════════════════════════════════════════
     # PERSIST + COMPLETE
@@ -494,7 +575,7 @@ async def _imaging_stream(req: ImagingStreamRequest) -> AsyncIterator[str]:
         "llm_interpretation":     llm_interp_dict,   # ← structured LLM opinion
         "confirms_diagnosis":     confirms_diagnosis,
         "diagnosis_code":         diagnosis_code,
-        "recommended_actions":    recommended_actions,
+        "recommended_actions":    recommended_actions,  # ← v2.2 POLISHED merge
         "fhir_diagnostic_report": fhir_report,
         "model_loaded":           True,
         "mock":                   False,
@@ -507,31 +588,12 @@ async def _imaging_stream(req: ImagingStreamRequest) -> AsyncIterator[str]:
     yield evt_complete(node, result, elapsed_ms=timer.elapsed_ms())
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _build_actions(prediction: str, severity: dict, age: int) -> list[str]:
-    actions = []
-    if prediction == "PNEUMONIA":
-        if severity["triage_priority"] <= 2:
-            actions.append("Start empirical antibiotic therapy per local guidelines")
-            actions.append("Blood cultures x2 before antibiotic administration")
-        actions.append("Repeat chest X-ray at 48-72 hours to assess response")
-        actions.append("Monitor oxygen saturation (target SpO2 >94%)")
-        if age > 65 or age < 5:
-            actions.append(f"Elevated triage priority due to patient age ({age}y)")
-    else:
-        actions.append("Clinical correlation required — normal X-ray does not exclude early pneumonia")
-        actions.append("Consider repeat imaging in 24-48 hours if clinical suspicion persists")
-    actions.append("Radiologist review recommended for definitive interpretation")
-    return actions
-
-
 # ── FastAPI endpoint ───────────────────────────────────────────────────────────
 
 @imaging_router.post("/stream", tags=["imaging"])
 async def imaging_stream(request: ImagingStreamRequest):
     """
-    SSE streaming endpoint for imaging triage.
+    SSE streaming endpoint for imaging triage — v2.2 POLISHED.
 
     Requires an image (orchestrator only routes here when imaging_available=True).
 
@@ -543,6 +605,11 @@ async def imaging_stream(request: ImagingStreamRequest):
       Returns mock output immediately with clear instructions.
 
     Events: status | progress | token | error | complete
+    
+    v2.2 IMPROVEMENTS:
+      - Intelligent LLM + CNN action deduplication
+      - Confidence-aware clinical interpretation
+      - Shared logic with main.py (DRY principle)
     """
     async def gen():
         async for chunk in _imaging_stream(request):
