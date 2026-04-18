@@ -27,13 +27,16 @@ class DigitalTwinRequest(BaseModel):
 
 
 class SensitivityAnalysis(BaseModel):
-    """Results of one-way sensitivity analysis on key risk factors"""
     feature_name: str
     baseline_value: float
-    risk_impact_if_improved_10_percent: dict
-    risk_impact_if_worsened_10_percent: dict
+    risk_impact_if_improved_20_percent: dict
+    risk_impact_if_worsened_20_percent: dict
     modifiable: bool
     clinical_intervention: Optional[str] = None
+    improvement_direction: Optional[str] = None
+    sensitivity_magnitude: Optional[float] = None
+    model_sensitivity: Optional[str] = None        # SENSITIVE | INSENSITIVE
+    insensitive_note: Optional[str] = None
 
 
 class PredictionWithUncertainty(BaseModel):
