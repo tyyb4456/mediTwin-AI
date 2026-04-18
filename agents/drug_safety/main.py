@@ -1,31 +1,32 @@
 """
-Agent 4: Drug Safety MCP Server — v2.1
-Port: 8004
+agents/drug_safety/main.py — v3.0 (Clinical Standards Upgrade)
 
-DUAL PURPOSE:
-  1. MCP Superpower — published to Prompt Opinion Marketplace.
-     Three tools: check_drug_interactions, get_contraindications, suggest_alternatives
+New in v3.0 over v2.1.1:
+─────────────────────────────────────────────────────────────────────────────
+1. Phase 0: Lab context assessment (deterministic, before everything)
+   - assess_critical_labs() reads patient_state.lab_results
+   - Flags WBC, creatinine, INR, K+, ALT, Hgb, platelets, eGFR
+   - sepsis_suspicion, renal_impairment_suspected, drug_selection_constraints
+   - Injected into all LLM prompts and FHIR notes
 
-  2. A2A component inside MediTwin — Orchestrator calls /check-safety (REST)
+2. Phase 2: Severity overrides after FDA label check
+   - apply_severity_overrides() upgrades Warfarin+NSAID → HIGH, etc.
+   - 20+ known dangerous pairs per ASHP/AHA/BNF guidelines
+   - Never downgrades — only upgrades
 
-CHANGES IN v2.1 (over v2.0):
-  - DB persistence via asyncpg (mirrors diagnosis / lab_analysis pattern)
-  - History endpoints at /history/* (same CRUD as other agents)
-  - /stream endpoint now streams LLM tokens for both enrichment phases
-  - /check-safety persists results to drug_safety_results table
-  - Lifespan wires db.init() / db.close()
+3. Phase 5b: Proactive alternatives for every flagged drug
+   - generate_proactive_alternatives() called concurrently for all flagged drugs
+   - Lab context steers away from renally-cleared drugs if Cr is high
+   - Sepsis flag tells LLM to prioritise broad-spectrum coverage
+   - Result in proactive_alternatives dict keyed by drug name
 
-Architecture:
-  FastMCP (stateless HTTP) mounted at /mcp/
-  FastAPI REST endpoints at / (root)
-  Single combined Starlette ASGI app
+4. Drug-specific FHIR notes
+   - build_fhir_medication_request() receives specific_reason per drug
+   - Amoxicillin: "Penicillin allergy — anaphylaxis cross-reactivity"
+   - Ibuprofen: "Atrial fibrillation + Warfarin — NSAID bleeding risk"
 
-Safety pipeline order (all runs in parallel where possible):
-  1. Local checks: allergy cross-reactivity + condition contraindications (deterministic, fast)
-  2. External API: RxNav interaction check + FDA warnings fetch (concurrent)
-  3. Determine preliminary safety_status from deterministic findings
-  4. LLM enrichment: interaction clinical context + patient risk profile (concurrent, additive)
-  5. Assemble final response + persist to DB
+5. lab_assessment field in API response
+   - Full ClinicalLabContext in output for orchestrator + UI
 """
 import os
 import sys
@@ -55,7 +56,11 @@ from safety_core import (
     get_alternative_suggestions_async,
     enrich_interactions_with_llm,
     generate_patient_risk_profile,
+    generate_proactive_alternatives,
     build_fhir_medication_request,
+    apply_severity_overrides,
+    assess_critical_labs,
+    ClinicalLabContext,
 )
 
 import db
@@ -63,7 +68,7 @@ from db import init as db_init, close as db_close, save_drug_safety, DrugSafetyR
 from history_router import router as history_router
 
 
-# ── Redis cache setup ─────────────────────────────────────────────────────────
+# ── Redis cache ───────────────────────────────────────────────────────────────
 
 _redis: Optional[aioredis.Redis] = None
 
@@ -106,7 +111,7 @@ async def cache_set(key: str, value: dict, ttl: int = 3600):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Core safety pipeline (shared by MCP tools AND REST endpoint)
+# Core safety pipeline — v3.0
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _run_full_safety_check(
@@ -117,60 +122,68 @@ async def _run_full_safety_check(
     patient_id: str = "unknown",
     patient_state: Optional[dict] = None,
     enrich_with_llm: bool = True,
-    persist: bool = True,           # NEW — set False from MCP tools (no patient_id context)
-    source: str = "check-safety",  # NEW — "check-safety" | "mcp"
+    persist: bool = True,
+    source: str = "check-safety",
 ) -> dict:
-    """
-    Full drug safety pipeline.
-
-    Phase 1 — Deterministic (fast, always runs):
-      1a. Allergy cross-reactivity check (local table)
-      1b. Condition contraindication check (local JSON)
-
-    Phase 2 — External APIs (concurrent):
-      2a. NLM RxNav drug-drug interaction check
-      2b. FDA OpenFDA black box / label warnings
-
-    Phase 3 — Safety status (from deterministic findings)
-
-    Phase 4 — LLM enrichment (concurrent, additive — never overrides rules):
-      4a. Clinical interaction enrichment (mechanism, monitoring, management)
-      4b. Patient-specific risk profile (synthesizes all signals)
-
-    Phase 5 — Assemble response + persist to DB
-    """
     all_drugs = proposed_medications + current_medications
     cache_key = (
-        f"drug_safety_v2:"
+        f"drug_safety_v3:"
         f"{':'.join(sorted(all_drugs))}:"
         f"{':'.join(sorted(a.get('substance','') for a in patient_allergies))}"
     )
-
     base_cached = await cache_get(cache_key)
     if base_cached and not enrich_with_llm:
         print("  ✓ Full cache hit")
         return base_cached
 
-    # ── Phase 1: Deterministic local checks ──────────────────────────────────
-    print("  Phase 1: Running deterministic safety checks...")
-    contraindications = []
-    approved = []
-    flagged = []
+    # ── Phase 0: Lab context ──────────────────────────────────────────────────
+    print("  Phase 0: Assessing critical lab values...")
+    lab_results = (patient_state or {}).get("lab_results", [])
+    lab_context: ClinicalLabContext = assess_critical_labs(lab_results)
+    if lab_context.critical_flags:
+        print(f"  Lab flags: {[f.display + '=' + str(f.value) + ' (' + f.flag + ')' for f in lab_context.critical_flags]}")
+    if lab_context.sepsis_suspicion:
+        print("  ⚠️  Sepsis suspected — antibiotic urgency elevated")
+
+    # ── Phase 1: Deterministic checks ────────────────────────────────────────
+    print("  Phase 1: Deterministic safety checks...")
+    contraindications: list[dict] = []
+    approved: list[str] = []
+    flagged: list[str] = []
+    drug_contraindications: dict[str, list[dict]] = {}
 
     for drug in proposed_medications:
-        drug_contras = []
+        drug_contras: list[dict] = []
         drug_contras.extend(check_allergy_cross_reactivity(drug, patient_allergies))
         drug_contras.extend(check_condition_contraindications(drug, active_conditions))
 
+        # Lab-driven NSAID check when renal impairment suspected from labs
+        if lab_context.renal_impairment_suspected:
+            drug_base = drug.lower().split()[0].strip().rstrip(".,")
+            if drug_base in ["ibuprofen", "naproxen", "diclofenac", "ketorolac", "meloxicam"]:
+                if not any("renal" in c.get("reason", "").lower() for c in drug_contras):
+                    drug_contras.append({
+                        "drug": drug,
+                        "condition_code": "LAB",
+                        "condition_display": "Suspected renal impairment (from lab values)",
+                        "severity": "HIGH",
+                        "reason": (
+                            f"Lab values suggest renal impairment — NSAIDs worsen renal perfusion. "
+                            f"{lab_context.overall_lab_summary}"
+                        ),
+                        "recommendation": f"Avoid {drug} given suspected renal impairment. Use acetaminophen for analgesia.",
+                        "type": "lab_driven_contraindication",
+                    })
+
+        drug_contraindications[drug] = drug_contras
         if drug_contras:
             contraindications.extend(drug_contras)
             flagged.append(drug)
         else:
             approved.append(drug)
 
-    # ── Phase 2: Concurrent external API calls ────────────────────────────────
-    print("  Phase 2: Fetching external safety data (RxNav + FDA)...")
-
+    # ── Phase 2: External APIs + severity overrides ───────────────────────────
+    print("  Phase 2: FDA interactions + severity overrides...")
     rxcui_map: dict = {}
     rxnav_interactions: list = []
     fda_warnings: dict = {}
@@ -180,27 +193,22 @@ async def _run_full_safety_check(
             get_rxcuis_batch(all_drugs),
             get_fda_warnings_batch(proposed_medications),
         )
-        rxcuis = [v for v in rxcui_map.values() if v]
-        if len(rxcuis) >= 2:
-            print(f"  Resolved {len(rxcuis)}/{len(all_drugs)} drugs to RxCUI — checking interactions...")
-            rxnav_interactions = await check_drug_interactions_by_name(all_drugs)
-        else:
-            print(f"  ⚠️  Only {len(rxcuis)} RxCUI(s) resolved — skipping RxNav interaction check")
+        rxnav_interactions = await check_drug_interactions_by_name(all_drugs)
+        if rxnav_interactions:
+            rxnav_interactions = apply_severity_overrides(rxnav_interactions)
+            upgraded = [i for i in rxnav_interactions if i.get("severity_upgraded")]
+            if upgraded:
+                print(f"  Severity upgraded: {[(i['drug_a'],i['drug_b'],i['severity']) for i in upgraded]}")
     else:
         fda_warnings = await get_fda_warnings_batch(proposed_medications)
 
-    # ── Phase 3: Determine safety status ─────────────────────────────────────
-    has_critical_contra = any(
-        c.get("severity") in ("CRITICAL", "HIGH") for c in contraindications
-    )
-    has_severe_interaction = any(
-        i.get("severity", "").upper() in ("HIGH", "CRITICAL")
-        for i in rxnav_interactions
-    )
+    print(f"  {len(rxnav_interactions)} interaction(s) found.")
+
+    # ── Phase 3: Safety status ────────────────────────────────────────────────
+    has_critical_contra = any(c.get("severity") in ("CRITICAL", "HIGH") for c in contraindications)
+    has_severe_interaction = any(i.get("severity", "").upper() in ("HIGH", "CRITICAL") for i in rxnav_interactions)
     has_black_box = any(
-        any("[BLACK BOX]" in w for w in warnings)
-        for warnings in fda_warnings.values()
-        if warnings
+        any("[BLACK BOX]" in w for w in ws) for ws in fda_warnings.values() if ws
     )
 
     if has_critical_contra or has_severe_interaction:
@@ -211,10 +219,9 @@ async def _run_full_safety_check(
         safety_status = "SAFE"
 
     # ── Phase 4: LLM enrichment ───────────────────────────────────────────────
-    enriched_interactions = None
-    patient_risk_profile = None
     interaction_enrichment = None
     risk_profile = None
+    patient_risk_profile = None
 
     _patient_ctx = patient_state or {
         "demographics": {"age": "unknown", "gender": "unknown"},
@@ -224,9 +231,9 @@ async def _run_full_safety_check(
     }
 
     if enrich_with_llm:
-        print("  Phase 4: LLM enrichment (interactions + risk profile)...")
-        llm_tasks = [
-            enrich_interactions_with_llm(rxnav_interactions, _patient_ctx),
+        print("  Phase 4: LLM enrichment (with lab context)...")
+        interaction_enrichment, risk_profile = await asyncio.gather(
+            enrich_interactions_with_llm(rxnav_interactions, _patient_ctx, lab_context),
             generate_patient_risk_profile(
                 patient_state=_patient_ctx,
                 proposed_medications=proposed_medications,
@@ -234,135 +241,185 @@ async def _run_full_safety_check(
                 interactions=rxnav_interactions,
                 fda_warnings=fda_warnings,
                 safety_status=safety_status,
+                lab_context=lab_context,
             ),
-        ]
-        interaction_enrichment, risk_profile = await asyncio.gather(*llm_tasks)
-
-        if interaction_enrichment:
-            enriched_interactions = interaction_enrichment.model_dump()
+        )
         if risk_profile:
             patient_risk_profile = risk_profile.model_dump()
 
-    # ── Phase 5: Assemble FHIR MedicationRequests for cleared drugs ───────────
-    risk_level = (
-        patient_risk_profile.get("overall_risk_level", "LOW")
-        if patient_risk_profile else "LOW"
-    )
+    # ── Phase 5a: LLM veto ────────────────────────────────────────────────────
+    llm_vetoed = False
+    if patient_risk_profile:
+        if not patient_risk_profile.get("safe_to_proceed", True) and \
+           patient_risk_profile.get("overall_risk_level") in ("CRITICAL", "HIGH"):
+            llm_vetoed = True
+            print(f"  ⚠️  LLM veto: {patient_risk_profile.get('overall_risk_level')} risk, moving {len(approved)} approved to flagged")
+            for drug in approved:
+                entry = {
+                    "drug": drug,
+                    "allergen": None,
+                    "reason": (
+                        f"LLM risk veto: overall risk {patient_risk_profile.get('overall_risk_level')}, "
+                        f"safe_to_proceed=False. {patient_risk_profile.get('clinical_summary','')}"
+                    ),
+                    "severity": patient_risk_profile.get("overall_risk_level"),
+                    "recommendation": patient_risk_profile.get("recommended_action", "DO_NOT_PRESCRIBE"),
+                    "type": "llm_risk_veto",
+                }
+                contraindications.append(entry)
+                drug_contraindications.setdefault(drug, []).append(entry)
+            flagged = flagged + approved
+            approved = []
+            safety_status = "UNSAFE"
 
-    fhir_medication_requests = []
-    for drug in approved:
-        interaction_note = ""
-        if any(i.get("severity", "").upper() == "MODERATE" for i in rxnav_interactions):
-            interaction_note = "Moderate drug interaction detected — monitor per clinician guidance."
-        fhir_medication_requests.append(
-            build_fhir_medication_request(
-                drug, patient_id,
-                safety_cleared=True,
-                safety_note=interaction_note,
-                risk_level=risk_level,
+    # ── Phase 5b: Proactive alternatives ─────────────────────────────────────
+    proactive_alternatives: dict[str, Optional[dict]] = {}
+    if enrich_with_llm and flagged:
+        print(f"  Phase 5b: Proactive alternatives for {len(flagged)} flagged drug(s)...")
+        alt_results = await asyncio.gather(*[
+            generate_proactive_alternatives(
+                drug_name=drug,
+                contraindications_for_drug=drug_contraindications.get(drug, []),
+                patient_state=_patient_ctx,
+                lab_context=lab_context,
+                active_conditions=active_conditions,
+                current_medications=[{"drug": m} for m in current_medications],
+                allergies=patient_allergies,
             )
-        )
+            for drug in flagged
+        ])
+        for drug, result in zip(flagged, alt_results):
+            proactive_alternatives[drug] = result.model_dump() if result else None
+            if result:
+                print(f"  Alternatives for {drug}: {[a.drug for a in result.alternatives]}")
 
-    # ── Merge LLM enrichment into interaction list ───────────────────────────
+    # ── Phase 5c: Merge enrichment ────────────────────────────────────────────
     enriched_rxnav = list(rxnav_interactions)
     if interaction_enrichment and interaction_enrichment.enriched_interactions:
-        for i, enrichment in enumerate(interaction_enrichment.enriched_interactions):
+        for i, e in enumerate(interaction_enrichment.enriched_interactions):
             if i < len(enriched_rxnav):
                 enriched_rxnav[i] = {
                     **enriched_rxnav[i],
-                    "mechanism":             enrichment.mechanism,
-                    "clinical_significance": enrichment.clinical_significance,
-                    "monitoring_parameters": enrichment.monitoring_parameters,
-                    "management_strategy":   enrichment.management_strategy,
-                    "time_to_onset":         enrichment.time_to_onset,
+                    "mechanism":             e.mechanism,
+                    "clinical_significance": e.clinical_significance,
+                    "monitoring_parameters": e.monitoring_parameters,
+                    "management_strategy":   e.management_strategy,
+                    "time_to_onset":         e.time_to_onset,
                 }
 
     interaction_risk_narrative = (
-        interaction_enrichment.overall_risk_narrative
-        if interaction_enrichment else None
+        interaction_enrichment.overall_risk_narrative if interaction_enrichment else None
     )
 
-    # ── DB persistence ────────────────────────────────────────────────────────
+    # ── Phase 5d: FHIR assembly — drug-specific notes ─────────────────────────
+    risk_level = (patient_risk_profile or {}).get("overall_risk_level", "LOW")
+    lab_note = lab_context.overall_lab_summary if lab_context.critical_flags else ""
+
+    def _get_specific_reason(drug: str) -> str:
+        drug_contras = drug_contraindications.get(drug, [])
+        if not drug_contras:
+            return "Safety concern identified."
+        top = max(drug_contras,
+                  key=lambda c: {"CRITICAL": 3, "HIGH": 2, "MODERATE": 1, "LOW": 0}.get(c.get("severity", "LOW"), 0))
+        reason = top.get("reason", "")
+        drug_base = drug.lower().split()[0]
+        for i in enriched_rxnav:
+            if drug_base in i.get("drug_a", "").lower() or drug_base in i.get("drug_b", "").lower():
+                other = i.get("drug_b") if drug_base in i.get("drug_a", "").lower() else i.get("drug_a")
+                reason += f" Additionally: {i.get('severity')} interaction with {other}."
+                break
+        return reason
+
+    fhir_medication_requests = []
+    for drug in approved:
+        interaction_note = next(
+            (f"{i.get('severity')} interaction with "
+             f"{i.get('drug_b') if drug.lower().split()[0] in i.get('drug_a','').lower() else i.get('drug_a')} — monitor."
+             for i in enriched_rxnav
+             if drug.lower().split()[0] in i.get("drug_a", "").lower()
+             or drug.lower().split()[0] in i.get("drug_b", "").lower()),
+            ""
+        )
+        fhir_medication_requests.append(
+            build_fhir_medication_request(drug, patient_id, safety_cleared=True,
+                                          safety_note=interaction_note, risk_level=risk_level,
+                                          lab_context_note=lab_note)
+        )
+    for drug in flagged:
+        fhir_medication_requests.append(
+            build_fhir_medication_request(drug, patient_id, safety_cleared=False,
+                                          risk_level=risk_level,
+                                          specific_reason=_get_specific_reason(drug),
+                                          lab_context_note=lab_note)
+        )
+
+    # ── Phase 6: Persist ──────────────────────────────────────────────────────
     request_id = str(uuid.uuid4())[:8]
     if persist:
-        await save_drug_safety(
-            DrugSafetyRecord(
-                request_id=request_id,
-                patient_id=patient_id,
-                proposed_medications=proposed_medications,
-                current_medications=current_medications,
-                safety_status=safety_status,
-                contraindications=contraindications,
-                approved_medications=approved,
-                flagged_medications=flagged,
-                critical_interactions=enriched_rxnav,
-                fda_warnings=fda_warnings,
-                patient_risk_profile=patient_risk_profile,
-                interaction_risk_narrative=interaction_risk_narrative,
-                fhir_medication_requests=fhir_medication_requests,
-                llm_enriched=enrich_with_llm and risk_profile is not None,
-                cache_hit=False,
-                source=source,
-            )
-        )
+        await save_drug_safety(DrugSafetyRecord(
+            request_id=request_id, patient_id=patient_id,
+            proposed_medications=proposed_medications, current_medications=current_medications,
+            safety_status=safety_status, contraindications=contraindications,
+            approved_medications=approved, flagged_medications=flagged,
+            critical_interactions=enriched_rxnav, fda_warnings=fda_warnings,
+            patient_risk_profile=patient_risk_profile,
+            interaction_risk_narrative=interaction_risk_narrative,
+            fhir_medication_requests=fhir_medication_requests,
+            llm_enriched=enrich_with_llm and risk_profile is not None,
+            cache_hit=False, source=source,
+        ))
 
     result = {
         "safety_status": safety_status,
-        "request_id": request_id,
-
-        # Core safety findings (deterministic)
-        "contraindications":       contraindications,
-        "critical_interactions":   enriched_rxnav,
-
-        # External data
-        "fda_warnings":            fda_warnings,
-        "rxcui_map":               rxcui_map,
-
-        # Medication verdicts
-        "approved_medications":    approved,
-        "flagged_medications":     flagged,
+        "request_id":    request_id,
+        "lab_assessment": {
+            "critical_flags":              [f.model_dump() for f in lab_context.critical_flags],
+            "sepsis_suspicion":            lab_context.sepsis_suspicion,
+            "renal_impairment_suspected":  lab_context.renal_impairment_suspected,
+            "hepatic_impairment_suspected":lab_context.hepatic_impairment_suspected,
+            "coagulopathy_suspected":      lab_context.coagulopathy_suspected,
+            "overall_lab_summary":         lab_context.overall_lab_summary,
+            "drug_selection_constraints":  lab_context.drug_selection_constraints,
+        },
+        "contraindications":        contraindications,
+        "critical_interactions":    enriched_rxnav,
+        "fda_warnings":             fda_warnings,
+        "rxcui_map":                rxcui_map,
+        "approved_medications":     approved,
+        "flagged_medications":      flagged,
         "fhir_medication_requests": fhir_medication_requests,
-
-        # LLM-generated patient-specific assessment
-        "patient_risk_profile": patient_risk_profile,
+        "proactive_alternatives":   proactive_alternatives,
+        "patient_risk_profile":     patient_risk_profile,
         "interaction_risk_narrative": interaction_risk_narrative,
-
-        # Summary counts
         "summary": {
             "proposed_count":         len(proposed_medications),
             "approved_count":         len(approved),
             "flagged_count":          len(flagged),
             "interaction_count":      len(rxnav_interactions),
             "contraindication_count": len(contraindications),
-            "black_box_warnings":     sum(
-                1 for w in fda_warnings.values()
-                if any("[BLACK BOX]" in x for x in w)
-            ),
-            "llm_enriched": enrich_with_llm and patient_risk_profile is not None,
+            "black_box_warnings":     sum(1 for w in fda_warnings.values() if any("[BLACK BOX]" in x for x in w)),
+            "severity_upgrades":      len([i for i in rxnav_interactions if i.get("severity_upgraded")]),
+            "critical_lab_flags":     len(lab_context.critical_flags),
+            "sepsis_suspicion":       lab_context.sepsis_suspicion,
+            "alternatives_generated": len([v for v in proactive_alternatives.values() if v]),
+            "llm_enriched":           enrich_with_llm and risk_profile is not None,
+            "llm_vetoed":             llm_vetoed,
         },
     }
 
-    # Cache the base result (without patient-specific LLM profile)
     base_result = {k: v for k, v in result.items()
-                   if k not in ("patient_risk_profile", "interaction_risk_narrative")}
+                   if k not in ("patient_risk_profile", "interaction_risk_narrative", "proactive_alternatives")}
     await cache_set(cache_key, base_result, ttl=3600)
-
     return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FastMCP — 3 MCP Tools
+# FastMCP — MCP Tools
 # ══════════════════════════════════════════════════════════════════════════════
 
 mcp = FastMCP(
     name="drug-safety-mcp",
-    instructions=(
-        "Drug safety checker for clinical decision support. "
-        "Checks drug-drug interactions (NLM RxNav), allergy cross-reactivity, "
-        "condition contraindications, and FDA black box warnings. "
-        "Returns safety verdicts, enriched clinical context, and safe alternatives. "
-        "SHARP context: pass patient_id to enable automatic patient data fetching."
-    ),
+    instructions="Drug safety checker v3.0 — lab context, severity overrides, proactive alternatives.",
     stateless_http=True,
     json_response=True,
 )
@@ -370,252 +427,89 @@ mcp = FastMCP(
 
 @mcp.tool()
 async def check_drug_interactions(
-    medications: Annotated[
-        list[str],
-        Field(
-            description=(
-                "List of drug names to check for interactions. "
-                "Include both proposed and current medications. "
-                "Example: ['Amoxicillin 500mg', 'Warfarin 5mg', 'Metformin 850mg']"
-            )
-        )
-    ],
-    patient_id: Annotated[
-        Optional[str],
-        Field(description="Optional FHIR patient ID. Enables SHARP context passthrough.")
-    ] = None,
+    medications: Annotated[list[str], Field(description="All medications to check. Include current + proposed.")],
+    patient_id: Annotated[Optional[str], Field(description="Optional FHIR patient ID.")] = None,
 ) -> dict:
-    """
-    Check for dangerous drug-drug interactions between a list of medications.
-    Uses FDA drug label warnings to detect cross-drug mentions.
-    Returns interactions with severity levels and LLM-enriched clinical context
-    (mechanism, monitoring parameters, management strategy).
-    """
+    """Check drug-drug interactions with FDA labels + severity overrides + LLM enrichment."""
     if len(medications) < 2:
-        return {"interactions": [], "message": "Need at least 2 medications to check interactions."}
-
+        return {"interactions": [], "message": "Need at least 2 medications."}
     interactions = await check_drug_interactions_by_name(medications)
-
-    minimal_state = {
-        "demographics": {"age": "unknown", "gender": "unknown"},
-        "active_conditions": [],
-        "medications": [{"drug": m} for m in medications],
-        "allergies": [],
-    }
+    interactions = apply_severity_overrides(interactions)
+    minimal_state = {"demographics": {"age":"unknown","gender":"unknown"}, "active_conditions":[], "medications":[{"drug":m} for m in medications], "allergies":[]}
     enrichment = await enrich_interactions_with_llm(interactions, minimal_state)
-
     enriched = list(interactions)
     if enrichment:
         for i, e in enumerate(enrichment.enriched_interactions):
             if i < len(enriched):
-                enriched[i] = {
-                    **enriched[i],
-                    "mechanism": e.mechanism,
-                    "clinical_significance": e.clinical_significance,
-                    "monitoring_parameters": e.monitoring_parameters,
-                    "management_strategy": e.management_strategy,
-                    "time_to_onset": e.time_to_onset,
-                }
-
-    return {
-        "medications_checked":    medications,
-        "interactions":           enriched,
-        "interaction_count":      len(interactions),
-        "high_severity_count":    sum(
-            1 for i in interactions if i.get("severity", "").upper() in ("HIGH", "CRITICAL")
-        ),
-        "overall_risk_narrative": enrichment.overall_risk_narrative if enrichment else None,
-        "source":                 "FDA Drug Label Warnings + LLM Clinical Enrichment",
-    }
+                enriched[i] = {**enriched[i], "mechanism": e.mechanism, "clinical_significance": e.clinical_significance, "monitoring_parameters": e.monitoring_parameters, "management_strategy": e.management_strategy, "time_to_onset": e.time_to_onset}
+    return {"medications_checked": medications, "interactions": enriched, "interaction_count": len(interactions), "high_severity_count": sum(1 for i in interactions if i.get("severity","").upper() in ("HIGH","CRITICAL")), "overall_risk_narrative": enrichment.overall_risk_narrative if enrichment else None}
 
 
 @mcp.tool()
 async def get_contraindications(
-    drug_name: Annotated[
-        str,
-        Field(description="Drug name to check. Include dose if known, e.g. 'Levofloxacin 750mg'.")
-    ],
-    conditions: Annotated[
-        Optional[list[str]],
-        Field(description="Patient's active ICD-10 condition codes. Example: ['N18.4', 'I50.9']")
-    ] = None,
-    allergies: Annotated[
-        Optional[list[str]],
-        Field(description="Patient's known allergens. Example: ['Penicillin', 'Sulfa']")
-    ] = None,
+    drug_name: Annotated[str, Field(description="Drug name to check.")],
+    conditions: Annotated[Optional[list[str]], Field(description="Patient ICD-10 codes.")] = None,
+    allergies: Annotated[Optional[list[str]], Field(description="Known allergens.")] = None,
 ) -> dict:
-    """
-    Check if a medication has contraindications for a patient's conditions or allergies.
-    Checks allergy cross-reactivity and condition contraindications.
-    Also fetches FDA black box warnings for the drug.
-    """
-    allergy_dicts = [
-        {"substance": a, "reaction": "unknown", "severity": "unknown"}
-        for a in (allergies or [])
-    ]
+    """Check allergy cross-reactivity, condition contraindications, and FDA black box warnings."""
+    allergy_dicts = [{"substance": a, "reaction": "unknown", "severity": "unknown"} for a in (allergies or [])]
     condition_dicts = [{"code": c, "display": c} for c in (conditions or [])]
-
     allergy_contras, condition_contras, fda_w = await asyncio.gather(
         asyncio.to_thread(check_allergy_cross_reactivity, drug_name, allergy_dicts),
         asyncio.to_thread(check_condition_contraindications, drug_name, condition_dicts),
         get_fda_warnings_batch([drug_name]),
     )
-
     all_contras = allergy_contras + condition_contras
     has_critical = any(c.get("severity") in ("CRITICAL", "HIGH") for c in all_contras)
-    drug_fda_warnings = fda_w.get(drug_name, [])
-
-    overall_verdict = (
-        "UNSAFE" if has_critical else
-        ("CAUTION" if all_contras or drug_fda_warnings else "SAFE")
-    )
-
-    return {
-        "drug":                        drug_name,
-        "overall_verdict":             overall_verdict,
-        "contraindications":           all_contras,
-        "contraindication_count":      len(all_contras),
-        "allergy_contraindications":   allergy_contras,
-        "condition_contraindications": condition_contras,
-        "fda_warnings":                drug_fda_warnings,
-        "has_black_box_warning":       any("[BLACK BOX]" in w for w in drug_fda_warnings),
-    }
+    drug_fda = fda_w.get(drug_name, [])
+    return {"drug": drug_name, "overall_verdict": "UNSAFE" if has_critical else ("CAUTION" if all_contras or drug_fda else "SAFE"), "contraindications": all_contras, "contraindication_count": len(all_contras), "allergy_contraindications": allergy_contras, "condition_contraindications": condition_contras, "fda_warnings": drug_fda, "has_black_box_warning": any("[BLACK BOX]" in w for w in drug_fda)}
 
 
 @mcp.tool()
 async def suggest_alternatives(
-    drug_name: Annotated[
-        str,
-        Field(description="The drug that cannot be prescribed. Example: 'Amoxicillin 500mg'")
-    ],
-    reason_for_avoidance: Annotated[
-        str,
-        Field(description="Why this drug cannot be used. Example: 'Penicillin allergy — anaphylaxis'")
-    ],
-    indication: Annotated[
-        str,
-        Field(description="What condition the drug was meant to treat. Example: 'Community-acquired pneumonia'")
-    ],
-    patient_conditions: Annotated[
-        Optional[list[str]],
-        Field(description="Patient's ICD-10 condition codes. Example: ['J18.9', 'N18.3']")
-    ] = None,
-    current_medications: Annotated[
-        Optional[list[str]],
-        Field(description="Patient's current medications. Example: ['Warfarin 5mg', 'Metformin 850mg']")
-    ] = None,
-    patient_allergies: Annotated[
-        Optional[list[str]],
-        Field(description="Known allergens to exclude. Example: ['Penicillin', 'Sulfa']")
-    ] = None,
+    drug_name: Annotated[str, Field(description="Drug that cannot be prescribed.")],
+    reason_for_avoidance: Annotated[str, Field(description="Why this drug cannot be used.")],
+    indication: Annotated[str, Field(description="What the drug was meant to treat.")],
+    patient_conditions: Annotated[Optional[list[str]], Field(description="Patient ICD-10 codes.")] = None,
+    current_medications: Annotated[Optional[list[str]], Field(description="Current medications.")] = None,
+    patient_allergies: Annotated[Optional[list[str]], Field(description="Known allergens.")] = None,
 ) -> dict:
-    """
-    Suggest safe medication alternatives when a drug has contraindications or interactions.
-    Uses LLM with structured output for clinical reasoning.
-    Returns ranked alternatives with rationale, drug class, interaction checks needed, and urgency.
-    """
-    condition_dicts = [{"code": c, "display": c} for c in (patient_conditions or [])]
-    med_dicts = [{"drug": m} for m in (current_medications or [])]
-    allergy_dicts = [
-        {"substance": a, "reaction": "unknown", "severity": "unknown"}
-        for a in (patient_allergies or [])
-    ]
-
+    """Suggest safe alternatives with LLM clinical reasoning."""
     result = await get_alternative_suggestions_async(
-        drug_name=drug_name,
-        reason_for_avoidance=reason_for_avoidance,
-        indication=indication,
-        patient_conditions=condition_dicts,
-        current_medications=med_dicts,
-        allergies=allergy_dicts,
+        drug_name=drug_name, reason_for_avoidance=reason_for_avoidance, indication=indication,
+        patient_conditions=[{"code": c, "display": c} for c in (patient_conditions or [])],
+        current_medications=[{"drug": m} for m in (current_medications or [])],
+        allergies=[{"substance": a, "reaction": "unknown", "severity": "unknown"} for a in (patient_allergies or [])],
     )
-
     if not result:
-        return {
-            "drug_to_replace": drug_name,
-            "alternatives": [],
-            "error": "LLM alternative suggestion unavailable. GOOGLE_API_KEY not set or API error.",
-        }
-
-    return {
-        "drug_to_replace":      drug_name,
-        "reason_for_avoidance": reason_for_avoidance,
-        "indication":           indication,
-        "alternatives":         [a.model_dump() for a in result.alternatives],
-        "clinical_note":        result.clinical_note,
-        "urgency":              result.urgency,
-        "source":               "LLM Clinical Pharmacist (Gemini 2.5 Flash)",
-    }
+        return {"drug_to_replace": drug_name, "alternatives": [], "error": "LLM unavailable."}
+    return {"drug_to_replace": drug_name, "reason_for_avoidance": reason_for_avoidance, "indication": indication, "alternatives": [a.model_dump() for a in result.alternatives], "clinical_note": result.clinical_note, "urgency": result.urgency}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FastAPI REST — for MediTwin Orchestrator internal calls
+# FastAPI REST
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SafetyCheckRequest(BaseModel):
-    proposed_medications: list[str] = Field(
-        description="Drugs being considered for prescription",
-        example=["Amoxicillin 500mg", "Ibuprofen 400mg"]
-    )
-    current_medications: list[str] = Field(
-        default_factory=list,
-        description="Drugs patient is already taking",
-        example=["Warfarin 5mg", "Metformin 850mg"]
-    )
-    patient_allergies: list[dict] = Field(
-        default_factory=list,
-        description="List of {substance, reaction, severity} dicts"
-    )
-    active_conditions: list[dict] = Field(
-        default_factory=list,
-        description="List of {code, display} ICD-10 condition dicts"
-    )
-    patient_id: str = Field(default="unknown")
-    patient_state: Optional[dict] = Field(
-        default=None,
-        description="Full PatientState object for richer LLM context (optional)"
-    )
-    enrich_with_llm: bool = Field(
-        default=True,
-        description="Set False to skip LLM enrichment (faster, for testing)"
-    )
+    proposed_medications: list[str] = Field(example=["Amoxicillin 500mg", "Ibuprofen 400mg"])
+    current_medications:  list[str] = Field(default_factory=list)
+    patient_allergies:    list[dict] = Field(default_factory=list)
+    active_conditions:    list[dict] = Field(default_factory=list)
+    patient_id:           str = Field(default="unknown")
+    patient_state:        Optional[dict] = Field(default=None)
+    enrich_with_llm:      bool = Field(default=True)
 
 
-rest_app = FastAPI(
-    title="MediTwin Drug Safety Agent",
-    description="Drug Safety MCP Server (v2.1) + REST API. LLM-enriched safety pipeline with DB persistence.",
-    version="2.1.0",
-)
-
+rest_app = FastAPI(title="MediTwin Drug Safety Agent", version="3.0.0")
 rest_app.include_router(stream_router)
 rest_app.include_router(history_router, prefix="/history", tags=["history"])
 
 from fastapi.middleware.cors import CORSMiddleware
-
-rest_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+rest_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @rest_app.post("/check-safety")
 async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
-    """
-    Full drug safety check — called by MediTwin Orchestrator.
-
-    Pipeline:
-      1. Allergy cross-reactivity (deterministic)
-      2. Condition contraindications (deterministic)
-      3. RxNav drug-drug interactions (external API)
-      4. FDA black box warnings (external API, concurrent with RxNav)
-      5. LLM interaction enrichment (structured Pydantic output)
-      6. LLM patient risk profile (structured Pydantic output)
-      7. FHIR MedicationRequest generation for cleared drugs
-      8. DB persistence (non-fatal)
-    """
     result = await _run_full_safety_check(
         proposed_medications=request.proposed_medications,
         current_medications=request.current_medications,
@@ -624,8 +518,7 @@ async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
         patient_id=request.patient_id,
         patient_state=request.patient_state,
         enrich_with_llm=request.enrich_with_llm,
-        persist=True,
-        source="check-safety",
+        persist=True, source="check-safety",
     )
     return JSONResponse(content=result)
 
@@ -634,54 +527,35 @@ async def check_safety(request: SafetyCheckRequest) -> JSONResponse:
 async def health() -> JSONResponse:
     r = await get_redis()
     return JSONResponse(content={
-        "status":          "healthy",
-        "agent":           "drug-safety",
-        "version":         "2.1.0",
-        "redis":           "connected" if r else "disconnected",
-        "db":              "connected" if db.is_available() else "disconnected",
-        "mcp_tools":       ["check_drug_interactions", "get_contraindications", "suggest_alternatives"],
-        "mcp_endpoint":    "/mcp/",
-        "rest_endpoint":   "/check-safety",
-        "stream_endpoint": "/stream",
-        "history_prefix":  "/history",
-        "llm_model":       "gemini-2.5-flash (structured output + token streaming)",
-        "external_apis":   ["NLM RxNav", "NLM RxNorm", "FDA OpenFDA"],
-        "local_databases": ["cross_reactivity_table", "contraindications.json"],
+        "status": "healthy", "agent": "drug-safety", "version": "3.0.0",
+        "redis": "connected" if r else "disconnected",
+        "db": "connected" if db.is_available() else "disconnected",
         "pipeline_phases": [
-            "1. Allergy cross-reactivity (deterministic)",
-            "2. Condition contraindications (deterministic)",
-            "3. RxNav interactions (async API)",
-            "4. FDA warnings (async API, concurrent)",
-            "5. LLM interaction enrichment (streamed tokens + structured output)",
-            "6. LLM patient risk profile (streamed tokens + structured output)",
-            "7. FHIR MedicationRequest assembly",
-            "8. DB persistence (asyncpg, non-fatal)",
+            "0. Critical lab assessment (WBC/Cr/INR/K+/ALT/Hgb/eGFR — deterministic)",
+            "1. Allergy cross-reactivity + condition contraindications + lab-driven checks",
+            "2. FDA label interactions + INTERACTION_SEVERITY_OVERRIDE table (20+ pairs)",
+            "3. Safety status",
+            "4. LLM enrichment with lab context",
+            "5a. LLM veto filter",
+            "5b. Proactive alternatives for every flagged drug (concurrent, with sepsis/renal context)",
+            "5c. Drug-specific FHIR notes",
+            "6. DB persistence",
         ],
     })
 
 
-# ── Mount MCP + REST into unified ASGI app ───────────────────────────────────
-# IMPORTANT: Starlette strips FastAPI sub-app lifespans when mounting.
-# The lifespan MUST live on the top-level Starlette app that uvicorn runs.
-
 @asynccontextmanager
 async def _lifespan(app: Starlette):
-    """Top-level lifespan — runs DB init/close for the combined Starlette app."""
     await db_init()
     yield
     await db_close()
 
 
 mcp_asgi = mcp.streamable_http_app()
-
 combined_app = Starlette(
-    routes=[
-        Mount("/mcp", app=mcp_asgi),
-        Mount("/",    app=rest_app),
-    ],
+    routes=[Mount("/mcp", app=mcp_asgi), Mount("/", app=rest_app)],
     lifespan=_lifespan,
 )
-
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,101 +1,238 @@
 {
   "_meta": {
-    "version": "1.0",
+    "version": "1.1",
     "description": "Drug contraindications by ICD-10 condition code. Clinician-reviewed heuristics.",
-    "sources": ["FDA drug labeling", "ATS/IDSA guidelines", "AHA/ACC guidelines"]
+    "sources": [
+      "FDA drug labeling",
+      "ATS/IDSA guidelines",
+      "AHA/ACC guidelines"
+    ]
   },
-
   "Ibuprofen": {
     "conditions": {
-      "N18.1": {"severity": "HIGH",   "reason": "CKD Stage 1 — NSAIDs worsen renal perfusion; avoid if possible"},
-      "N18.2": {"severity": "HIGH",   "reason": "CKD Stage 2 — NSAIDs worsen renal perfusion; avoid if possible"},
-      "N18.3": {"severity": "HIGH",   "reason": "CKD Stage 3 — NSAIDs contraindicated"},
-      "N18.4": {"severity": "HIGH",   "reason": "CKD Stage 4 — NSAIDs contraindicated"},
-      "N18.5": {"severity": "CRITICAL","reason": "CKD Stage 5/ESRD — NSAIDs absolutely contraindicated"},
-      "N17.9": {"severity": "HIGH",   "reason": "Acute kidney injury — NSAIDs worsen AKI, avoid"},
-      "K25.0": {"severity": "HIGH",   "reason": "Active gastric ulcer — NSAIDs increase GI bleeding risk"},
-      "K26.0": {"severity": "HIGH",   "reason": "Active duodenal ulcer — NSAIDs increase GI bleeding risk"},
-      "I50.9": {"severity": "HIGH",   "reason": "Heart failure — NSAIDs cause sodium retention, worsen CHF"},
-      "I50.1": {"severity": "HIGH",   "reason": "Left ventricular failure — NSAIDs contraindicated"},
-      "I50.0": {"severity": "HIGH",   "reason": "Congestive heart failure — NSAIDs contraindicated"}
+      "N18.1": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 1 — NSAIDs worsen renal perfusion; avoid if possible"
+      },
+      "N18.2": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 2 — NSAIDs worsen renal perfusion; avoid if possible"
+      },
+      "N18.3": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 3 — NSAIDs contraindicated"
+      },
+      "N18.4": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 4 — NSAIDs contraindicated"
+      },
+      "N18.5": {
+        "severity": "CRITICAL",
+        "reason": "CKD Stage 5/ESRD — NSAIDs absolutely contraindicated"
+      },
+      "N17.9": {
+        "severity": "HIGH",
+        "reason": "Acute kidney injury — NSAIDs worsen AKI, avoid"
+      },
+      "K25.0": {
+        "severity": "HIGH",
+        "reason": "Active gastric ulcer — NSAIDs increase GI bleeding risk"
+      },
+      "K26.0": {
+        "severity": "HIGH",
+        "reason": "Active duodenal ulcer — NSAIDs increase GI bleeding risk"
+      },
+      "I50.9": {
+        "severity": "HIGH",
+        "reason": "Heart failure — NSAIDs cause sodium retention, worsen CHF"
+      },
+      "I50.1": {
+        "severity": "HIGH",
+        "reason": "Left ventricular failure — NSAIDs contraindicated"
+      },
+      "I50.0": {
+        "severity": "HIGH",
+        "reason": "Congestive heart failure — NSAIDs contraindicated"
+      },
+      "I48.0": {
+        "severity": "HIGH",
+        "reason": "Atrial fibrillation — NSAIDs increase stroke and bleeding risk, worsen rate control; avoid especially with anticoagulants like Warfarin"
+      },
+      "I48.1": {
+        "severity": "HIGH",
+        "reason": "Persistent atrial fibrillation — NSAIDs increase stroke/bleeding risk; avoid with anticoagulants"
+      },
+      "I48.2": {
+        "severity": "HIGH",
+        "reason": "Chronic atrial fibrillation — NSAIDs increase stroke/bleeding risk"
+      },
+      "I48.9": {
+        "severity": "HIGH",
+        "reason": "Atrial fibrillation — NSAIDs increase stroke and bleeding risk with anticoagulant therapy"
+      }
     }
   },
-
   "Naproxen": {
     "conditions": {
-      "N18.3": {"severity": "HIGH",   "reason": "CKD Stage 3+ — NSAIDs worsen renal function"},
-      "N18.4": {"severity": "HIGH",   "reason": "CKD Stage 4 — NSAIDs contraindicated"},
-      "N18.5": {"severity": "CRITICAL","reason": "CKD Stage 5/ESRD — NSAIDs absolutely contraindicated"},
-      "K25.0": {"severity": "HIGH",   "reason": "Active gastric ulcer — NSAIDs increase bleeding risk"},
-      "I50.9": {"severity": "HIGH",   "reason": "Heart failure — NSAIDs cause sodium/fluid retention"}
+      "N18.3": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 3+ — NSAIDs worsen renal function"
+      },
+      "N18.4": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 4 — NSAIDs contraindicated"
+      },
+      "N18.5": {
+        "severity": "CRITICAL",
+        "reason": "CKD Stage 5/ESRD — NSAIDs absolutely contraindicated"
+      },
+      "K25.0": {
+        "severity": "HIGH",
+        "reason": "Active gastric ulcer — NSAIDs increase bleeding risk"
+      },
+      "I50.9": {
+        "severity": "HIGH",
+        "reason": "Heart failure — NSAIDs cause sodium/fluid retention"
+      },
+      "I48.0": {
+        "severity": "HIGH",
+        "reason": "Atrial fibrillation — NSAIDs increase bleeding risk with anticoagulants"
+      },
+      "I48.9": {
+        "severity": "HIGH",
+        "reason": "Atrial fibrillation — NSAIDs increase bleeding risk with anticoagulants"
+      }
     }
   },
-
   "Metformin": {
     "conditions": {
-      "N18.4": {"severity": "HIGH",   "reason": "CKD Stage 4 (eGFR 15-29) — lactic acidosis risk, contraindicated"},
-      "N18.5": {"severity": "CRITICAL","reason": "CKD Stage 5/ESRD — metformin contraindicated, lactic acidosis risk"},
-      "N17.9": {"severity": "HIGH",   "reason": "Acute kidney injury — hold metformin until renal function recovers"},
-      "K70.3": {"severity": "HIGH",   "reason": "Alcoholic cirrhosis — lactic acidosis risk"},
-      "K74.6": {"severity": "HIGH",   "reason": "Liver cirrhosis — lactic acidosis risk, contraindicated"}
+      "N18.4": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 4 (eGFR 15-29) — lactic acidosis risk, contraindicated"
+      },
+      "N18.5": {
+        "severity": "CRITICAL",
+        "reason": "CKD Stage 5/ESRD — metformin contraindicated, lactic acidosis risk"
+      },
+      "N17.9": {
+        "severity": "HIGH",
+        "reason": "Acute kidney injury — hold metformin until renal function recovers"
+      },
+      "K70.3": {
+        "severity": "HIGH",
+        "reason": "Alcoholic cirrhosis — lactic acidosis risk"
+      },
+      "K74.6": {
+        "severity": "HIGH",
+        "reason": "Liver cirrhosis — lactic acidosis risk, contraindicated"
+      }
     }
   },
-
   "Amoxicillin": {
     "conditions": {}
   },
-
   "Levofloxacin": {
     "conditions": {
-      "G70.00": {"severity": "CRITICAL","reason": "Myasthenia gravis — fluoroquinolones can cause life-threatening exacerbation"},
-      "G70.01": {"severity": "CRITICAL","reason": "Myasthenia gravis with exacerbation — fluoroquinolones contraindicated"},
-      "M10.9":  {"severity": "MODERATE","reason": "Gout — fluoroquinolones can increase uric acid levels"}
+      "G70.00": {
+        "severity": "CRITICAL",
+        "reason": "Myasthenia gravis — fluoroquinolones can cause life-threatening exacerbation"
+      },
+      "G70.01": {
+        "severity": "CRITICAL",
+        "reason": "Myasthenia gravis with exacerbation — fluoroquinolones contraindicated"
+      },
+      "M10.9": {
+        "severity": "MODERATE",
+        "reason": "Gout — fluoroquinolones can increase uric acid levels"
+      }
     }
   },
-
   "Moxifloxacin": {
     "conditions": {
-      "G70.00": {"severity": "CRITICAL","reason": "Myasthenia gravis — fluoroquinolones contraindicated"},
-      "G70.01": {"severity": "CRITICAL","reason": "Myasthenia gravis with exacerbation — absolute contraindication"},
-      "I44.1":  {"severity": "HIGH",   "reason": "AV block 2nd degree — moxifloxacin prolongs QT, avoid"},
-      "I45.81": {"severity": "HIGH",   "reason": "Long QT syndrome — moxifloxacin contraindicated"}
+      "G70.00": {
+        "severity": "CRITICAL",
+        "reason": "Myasthenia gravis — fluoroquinolones contraindicated"
+      },
+      "G70.01": {
+        "severity": "CRITICAL",
+        "reason": "Myasthenia gravis with exacerbation — absolute contraindication"
+      },
+      "I44.1": {
+        "severity": "HIGH",
+        "reason": "AV block 2nd degree — moxifloxacin prolongs QT, avoid"
+      },
+      "I45.81": {
+        "severity": "HIGH",
+        "reason": "Long QT syndrome — moxifloxacin contraindicated"
+      }
     }
   },
-
   "Ciprofloxacin": {
     "conditions": {
-      "G70.00": {"severity": "CRITICAL","reason": "Myasthenia gravis — fluoroquinolones contraindicated"},
-      "N18.4":  {"severity": "MODERATE","reason": "CKD Stage 4 — reduce ciprofloxacin dose (renal excretion)"},
-      "N18.5":  {"severity": "HIGH",   "reason": "CKD Stage 5/ESRD — significant dose reduction required"}
+      "G70.00": {
+        "severity": "CRITICAL",
+        "reason": "Myasthenia gravis — fluoroquinolones contraindicated"
+      },
+      "N18.4": {
+        "severity": "MODERATE",
+        "reason": "CKD Stage 4 — reduce ciprofloxacin dose (renal excretion)"
+      },
+      "N18.5": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 5/ESRD — significant dose reduction required"
+      }
     }
   },
-
   "Warfarin": {
     "conditions": {
-      "K25.0": {"severity": "HIGH",   "reason": "Active gastric ulcer — warfarin increases GI bleeding risk"},
-      "K70.3": {"severity": "HIGH",   "reason": "Alcoholic cirrhosis — unpredictable INR, bleeding risk"},
-      "I61.9": {"severity": "CRITICAL","reason": "Hemorrhagic stroke — warfarin absolutely contraindicated acutely"}
+      "K25.0": {
+        "severity": "HIGH",
+        "reason": "Active gastric ulcer — warfarin increases GI bleeding risk"
+      },
+      "K70.3": {
+        "severity": "HIGH",
+        "reason": "Alcoholic cirrhosis — unpredictable INR, bleeding risk"
+      },
+      "I61.9": {
+        "severity": "CRITICAL",
+        "reason": "Hemorrhagic stroke — warfarin absolutely contraindicated acutely"
+      }
     }
   },
-
   "Clarithromycin": {
     "conditions": {
-      "K74.6": {"severity": "HIGH",   "reason": "Liver cirrhosis — clarithromycin hepatotoxicity risk, use alternative"}
+      "K74.6": {
+        "severity": "HIGH",
+        "reason": "Liver cirrhosis — clarithromycin hepatotoxicity risk, use alternative"
+      }
     }
   },
-
   "Codeine": {
     "conditions": {
-      "J96.0": {"severity": "HIGH",   "reason": "Acute respiratory failure — opioids cause respiratory depression"},
-      "J96.1": {"severity": "HIGH",   "reason": "Chronic respiratory failure — opioids worsen CO2 retention"},
-      "G47.33":{"severity": "HIGH",   "reason": "Obstructive sleep apnea — opioids worsen apnea, avoid"}
+      "J96.0": {
+        "severity": "HIGH",
+        "reason": "Acute respiratory failure — opioids cause respiratory depression"
+      },
+      "J96.1": {
+        "severity": "HIGH",
+        "reason": "Chronic respiratory failure — opioids worsen CO2 retention"
+      },
+      "G47.33": {
+        "severity": "HIGH",
+        "reason": "Obstructive sleep apnea — opioids worsen apnea, avoid"
+      }
     }
   },
-
   "Morphine": {
     "conditions": {
-      "N18.4": {"severity": "HIGH",   "reason": "CKD Stage 4 — morphine metabolite accumulates, causes CNS toxicity"},
-      "N18.5": {"severity": "CRITICAL","reason": "CKD Stage 5/ESRD — avoid morphine, use fentanyl or hydromorphone instead"}
+      "N18.4": {
+        "severity": "HIGH",
+        "reason": "CKD Stage 4 — morphine metabolite accumulates, causes CNS toxicity"
+      },
+      "N18.5": {
+        "severity": "CRITICAL",
+        "reason": "CKD Stage 5/ESRD — avoid morphine, use fentanyl or hydromorphone instead"
+      }
     }
   }
 }
