@@ -264,6 +264,47 @@ def _generate_simulation_hash(request: DigitalTwinRequest) -> str:
     )
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
+def _resolve_option_cost(opt) -> tuple:
+    """
+    Returns (cost_usd: float, cost_source: str).
+    cost_source: "provided" | "imputed" | "zero"
+    Bug 3 fix: tracks cost origin so cost_source is never mis-tagged.
+    """
+    from simulator import DRUG_EFFECTS
+ 
+    raw = opt.estimated_cost_usd
+ 
+    # Caller explicitly provided a real cost
+    if raw is not None and raw > 0:
+        return float(raw), "provided"
+ 
+    # No-treatment baseline
+    if opt.option_id == "C" or (not opt.drugs and not opt.interventions):
+        return 0.0, "zero"
+ 
+    # Impute from drug effect table + intervention heuristics
+    imputed = 0.0
+    for drug in opt.drugs:
+        key = drug.lower().split()[0].rstrip(".,")
+        if "clavulanate" in drug.lower():
+            key = "amoxicillin-clavulanate"
+        imputed += DRUG_EFFECTS.get(key, {}).get("cost_usd", 50)  # $50 default
+ 
+    for iv in opt.interventions:
+        iv_lower = iv.lower()
+        if "hospitalization" in iv_lower:
+            imputed += 12_000
+        elif "iv fluids" in iv_lower:
+            imputed += 250
+        elif "monitoring" in iv_lower:
+            imputed += 2_000
+        elif "o2" in iv_lower or "oxygen" in iv_lower:
+            imputed += 150
+        else:
+            imputed += 100
+ 
+    imputed += 200  # baseline monitoring / labs
+    return round(imputed, 2), "imputed"
 
 # ── Main Simulation Endpoint ──────────────────────────────────────────────────
 
@@ -431,15 +472,8 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             key_risks.append("Low overall risk with this treatment")
 
         # FIX #10: resolve imputed cost now and store on the scenario
-        resolved_cost = opt.estimated_cost_usd
-        if resolved_cost is None or resolved_cost == 0:
-            if any("hospitalization" in i.lower() for i in opt.interventions):
-                resolved_cost = 15_000
-            elif opt.option_id == "C" and not opt.drugs:
-                resolved_cost = 0
-            else:
-                resolved_cost = 500
-
+        resolved_cost, cost_source = _resolve_option_cost(opt)
+ 
         scenarios.append({
             "option_id":           opt.option_id,
             "label":               opt.label,
@@ -450,7 +484,8 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             "key_risks":           key_risks,
             "guideline_adherence": guideline_adherence,
             "safety_check":        safety_check,
-            "estimated_cost_usd":  resolved_cost,   # FIX #10: never null
+            "estimated_cost_usd":  resolved_cost,
+            "cost_source":         cost_source,
         })
 
     # 6. Select recommended option (exclude baseline "C")
@@ -539,21 +574,25 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
     )
 
     # FIX #9: provenance.prediction_horizons shows requested vs available
-    requested_horizons  = request.prediction_horizons or ["7d", "30d"]
-    available_horizons  = list(baseline_risks_with_ci.keys())
+    requested_horizons = request.prediction_horizons or ["7d", "30d"]
+    available_horizons = list(baseline_risks_with_ci.keys())
+
+    # 7d is fulfilled if any scenario has recovery_probability_7d computed
+    has_7d = any(
+        s.get("predictions", {}).get("recovery_probability_7d") is not None
+        for s in scenarios
+    )
+
     horizon_map = {
-        "7d":  "recovery_probability_7d",
-        "30d": ["readmission_30d", "mortality_30d", "complication"],
-        "90d": "readmission_90d",
-        "1yr": "mortality_1yr",
+        "7d":  lambda: has_7d,
+        "30d": lambda: any(k in available_horizons for k in ["readmission_30d", "mortality_30d", "complication"]),
+        "90d": lambda: "readmission_90d" in available_horizons,
+        "1yr": lambda: "mortality_1yr" in available_horizons,
     }
+
     fulfilled_horizons = [
         h for h in requested_horizons
-        if any(
-            (k in available_horizons if isinstance(horizon_map.get(h), str) else
-             any(x in available_horizons for x in horizon_map.get(h, [])))
-            for k in ([horizon_map[h]] if isinstance(horizon_map.get(h), str) else horizon_map.get(h, []))
-        )
+        if horizon_map.get(h, lambda: False)()
     ]
 
     provenance = {
@@ -564,10 +603,18 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         "feature_count":        len(FEATURE_NAMES),
         "requested_horizons":   requested_horizons,
         "fulfilled_horizons":   fulfilled_horizons,
+        "unfulfilled_horizons": [h for h in requested_horizons if h not in fulfilled_horizons],
+        "horizon_gap_reason": (
+            "Extended models (readmission_90d, mortality_1yr) not loaded — "
+            "run train_models.py to enable 90d and 1yr predictions."
+            if any(h not in fulfilled_horizons for h in requested_horizons)
+            else None
+        ),
         "available_model_keys": available_horizons,
         "overall_confidence":   model_confidence,
         "reproducible":         True,
     }
+ 
 
     return DigitalTwinResponse(
         simulation_summary=sanitize({

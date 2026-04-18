@@ -47,6 +47,74 @@ class TwinStreamRequest(BaseModel):
     treatment_options: list = []
     include_sensitivity_analysis: bool = True
     include_cost_analysis: bool = True
+
+def _extract_ddi_monitoring_context(scenarios: list, recommended_id: str) -> str:
+    """
+    Build a specific monitoring context string from the recommended scenario's
+    safety_check interaction_alerts, so the LLM can generate concrete actions.
+    """
+    rec_scenario = next((s for s in scenarios if s.get("option_id") == recommended_id), None)
+    if not rec_scenario:
+        return ""
+ 
+    safety = rec_scenario.get("safety_check") or {}
+    interactions = safety.get("interaction_alerts", [])
+    allergy_alerts = safety.get("allergy_alerts", [])
+ 
+    if not interactions and not allergy_alerts:
+        return ""
+ 
+    lines = []
+ 
+    for ia in interactions:
+        proposed = ia.get("proposed_drug", "")
+        existing  = ia.get("existing_drug", "")
+        warning   = ia.get("warning", "")
+ 
+        # Generate specific monitoring instructions based on known interaction patterns
+        if "warfarin" in existing.lower() or "warfarin" in proposed.lower():
+            if "azithromycin" in proposed.lower() or "azithromycin" in warning.lower():
+                lines.append(
+                    f"DDI ({proposed} ↔ {existing}): {warning}. "
+                    f"REQUIRED ACTIONS: (1) Check baseline INR before prescribing. "
+                    f"(2) Recheck INR at 48-72 hours after starting azithromycin. "
+                    f"(3) Hold or reduce warfarin dose if INR >3.5. "
+                    f"(4) Target INR 2.0-3.0 for AF."
+                )
+            elif "levofloxacin" in proposed.lower() or "moxifloxacin" in proposed.lower():
+                lines.append(
+                    f"DDI ({proposed} ↔ {existing}): {warning}. "
+                    f"REQUIRED ACTIONS: (1) Check baseline INR before prescribing. "
+                    f"(2) Recheck INR at 3-5 days. "
+                    f"(3) Reduce warfarin dose by 20-25% empirically if high-risk patient."
+                )
+            elif "ceftriaxone" in proposed.lower():
+                lines.append(
+                    f"DDI ({proposed} ↔ {existing}): {warning}. "
+                    f"REQUIRED ACTION: Routine INR monitoring — recheck within 5-7 days."
+                )
+            else:
+                lines.append(
+                    f"DDI ({proposed} ↔ {existing}): {warning}. "
+                    f"REQUIRED ACTION: Monitor INR closely during co-administration."
+                )
+        elif "metformin" in existing.lower() or "metformin" in proposed.lower():
+            lines.append(
+                f"DDI ({proposed} ↔ {existing}): {warning}. "
+                f"REQUIRED ACTION: Hold metformin 48h before and after any iodinated contrast."
+            )
+        else:
+            lines.append(f"DDI ({proposed} ↔ {existing}): {warning}.")
+ 
+    for aa in allergy_alerts:
+        if aa.get("cross_reactivity"):
+            lines.append(
+                f"Cross-reactivity alert ({aa.get('drug')} ↔ documented {aa.get('allergen')} allergy, "
+                f"{aa.get('severity')} severity): Verify tolerance before prescribing — "
+                f"consider allergy skin testing or graded challenge if clinically necessary."
+            )
+ 
+    return "\n".join(lines)
  
  
 async def _build_narrative_prompt(
@@ -59,17 +127,22 @@ async def _build_narrative_prompt(
     sensitivity_top_3: Optional[list],
     cost_effectiveness: Optional[dict],
 ) -> tuple[ChatPromptTemplate, dict]:
-    """Build LLM prompt for narrative generation. Returns (prompt, inputs)."""
-    demo = patient_state.get("demographics", {})
-    age = demo.get("age", "?")
+    """
+    Bug 4 Fix: Build LLM prompt with DDI-specific monitoring instructions injected.
+    The MONITORING section now receives the full interaction context so the LLM
+    generates concrete, drug-specific actions rather than generic language.
+    """
+    demo   = patient_state.get("demographics", {})
+    age    = demo.get("age", "?")
     gender = demo.get("gender", "patient")
-    
-    # Build scenario lines
+ 
     scenario_lines = []
     for s in scenarios:
-        preds = s.get("predictions", {})
+        preds     = s.get("predictions", {})
         guideline = s.get("guideline_adherence", {})
-
+        if isinstance(guideline, list):
+            guideline = guideline[0] if guideline else {}
+ 
         adherence_note = ""
         if guideline:
             adherence = guideline.get("adherence", "")
@@ -79,40 +152,73 @@ async def _build_narrative_prompt(
                 adherence_note = " [SECOND-LINE]"
             elif adherence == "OFF_GUIDELINE":
                 adherence_note = " [OFF-GUIDELINE]"
-
+            elif adherence == "INPATIENT_APPROPRIATE":
+                adherence_note = " [INPATIENT guideline]"
+ 
+        safety_flag = (s.get("safety_check") or {}).get("safety_flag", "SAFE")
+        safety_note = ""
+        if safety_flag == "CONTRAINDICATED":
+            safety_note = " [CONTRAINDICATED — excluded from recommendation]"
+        elif safety_flag == "INTERACTION_WARNING":
+            safety_note = " [DDI warning — see monitoring]"
+ 
         scenario_lines.append(
-            f"Option {s['option_id']} ({s['label']}){adherence_note}: "
+            f"Option {s['option_id']} ({s['label']}){adherence_note}{safety_note}: "
             f"7d recovery {preds.get('recovery_probability_7d', 0):.0%}, "
             f"30d mortality {preds.get('mortality_risk_30d', 0):.0%}, "
             f"30d readmission {preds.get('readmission_risk_30d', 0):.0%}"
         )
-
+ 
     conditions = patient_state.get("active_conditions", [])
     comorbidity_summary = ", ".join([c.get("display", "") for c in conditions[:3]])
-
+ 
     sensitivity_context = ""
     if sensitivity_top_3:
-        sensitivity_context = "\n\nKey modifiable risk factors:\n" + "\n".join([
-            f"- {s['feature_name']}: 10% improvement → "
-            f"{abs(s['risk_impact_if_improved_10_percent']['mortality_30d_change']):.1f}% mortality reduction"
-            for s in sensitivity_top_3[:3]
-        ])
-
+        modifiable = [s for s in sensitivity_top_3 if s.get("modifiable")]
+        if modifiable:
+            sensitivity_context = "\n\nKey modifiable risk factors:\n" + "\n".join([
+                f"- {s['feature_name']} ({s.get('clinical_intervention', 'intervention available')}): "
+                f"improvement → {abs(s.get('risk_impact_if_improved', s.get('risk_impact_if_improved_20_percent', {})).get('mortality_30d_change', 0)):.1f}% mortality reduction"
+                for s in modifiable[:3]
+            ])
+ 
     cost_context = ""
     if cost_effectiveness:
         most_ce = cost_effectiveness.get("most_cost_effective")
         cost_context = (
             f"\n\nCost-effectiveness: Option {most_ce} is most cost-effective "
-            "at current willingness-to-pay threshold."
+            "among treatment options."
         )
-
+ 
+    # --- Bug 4 fix: inject DDI-specific monitoring context ---
+    ddi_monitoring = _extract_ddi_monitoring_context(scenarios, recommended_option)
+    monitoring_instruction = (
+        f"\n\nDrug interaction monitoring requirements for recommended option:\n{ddi_monitoring}"
+        if ddi_monitoring else
+        "\n\nNo significant drug interactions for recommended option."
+    )
+ 
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a clinical decision support system providing evidence-based treatment recommendations. "
-         "Write exactly 4-5 sentences using specific data from the simulation. "
-         "Focus on: (1) patient-specific risk factors, (2) numerical comparison of outcomes, "
-         "(3) guideline adherence, (4) key modifiable factors. "
-         "End with: 'This is AI-generated decision support requiring physician validation.'"),
+         "You are a clinical decision support system generating structured clinical decision support notes. "
+         "Use the following format exactly:\n\n"
+         "IMPRESSION: One sentence summarizing patient risk profile and primary diagnosis.\n\n"
+         "SAFETY: One sentence. If any option is CONTRAINDICATED, name it explicitly, state why "
+         "(allergy/cross-reactivity/DDI), and confirm it is excluded from recommendation.\n\n"
+         "RECOMMENDATION: One to two sentences. State the recommended option, cite its key outcome "
+         "metrics (7d recovery, 30d mortality, readmission), and note guideline adherence status.\n\n"
+         "MONITORING: Two to three sentences. Use the 'Drug interaction monitoring requirements' provided "
+         "below — cite the specific drugs, the specific INR targets, specific timing of rechecks, and "
+         "any dose adjustment thresholds. Do NOT write generic phrases like 'monitor closely' — "
+         "write the exact clinical actions (e.g. 'Check baseline INR before prescribing azithromycin, "
+         "recheck at 48-72h, hold warfarin if INR >3.5, target INR 2.0-3.0 for atrial fibrillation').\n\n"
+         "MODIFIABLE RISK FACTORS: One sentence. Name 1-2 specific modifiable lab factors with their "
+         "quantified mortality impact from the sensitivity data. Do NOT mention age.\n\n"
+         "CRITICAL RULES:\n"
+         "- CONTRAINDICATED options must never appear as recommendations or alternatives.\n"
+         "- All percentages must come from the simulation data provided — do not invent numbers.\n"
+         "- MONITORING must reference the specific drug names and specific clinical thresholds given.\n"
+         "- End with exactly: 'This is AI-generated decision support requiring physician validation.'"),
         ("human",
          f"Patient: {age}y {gender}. "
          f"Diagnosis: {diagnosis} (ICD-10: {diagnosis_code or 'not specified'}). "
@@ -121,10 +227,11 @@ async def _build_narrative_prompt(
          f"Treatment scenarios:\n" + "\n".join(scenario_lines) + "\n\n"
          f"Recommended: Option {recommended_option}"
          f"{sensitivity_context}"
-         f"{cost_context}\n\n"
-         "Provide evidence-based clinical narrative justifying the recommendation."),
+         f"{cost_context}"
+         f"{monitoring_instruction}\n\n"
+         "Generate the structured clinical decision support note."),
     ])
-    
+ 
     return prompt, {}
 
 

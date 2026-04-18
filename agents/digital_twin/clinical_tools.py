@@ -317,7 +317,42 @@ def estimate_qaly_impact(
         "value_at_100k_threshold_usd": round(value_at_threshold, 2),
         "cost_effective_if_treatment_cost_below_usd": round(value_at_threshold, 2),
     }
-
+ 
+ 
+EXTREME_VALUE_THRESHOLDS = {
+    "wbc":               12.0,   # >12 = elevated; >15 = concerning
+    "crp":               50.0,   # >50 = significant inflammation
+    "creatinine":        1.5,    # >1.5 = renal impairment
+    "glucose":           180.0,  # >180 = hyperglycaemia
+    "critical_lab_count": 1,     # any critical flag = high perturbation
+}
+ 
+ 
+def _gradient_search(
+    model,
+    feature_vector: List[float],
+    feat_idx: int,
+    baseline_pred: float,
+    direction: str,
+    max_pct: float = 0.60,
+    step_pct: float = 0.05,
+) -> tuple[float | None, float | None]:
+    """
+    Walk perturbation from step_pct up to max_pct in steps.
+    Returns (first_pct_that_caused_change, new_pred_at_that_pct)
+    or (None, None) if truly insensitive across the full range.
+    """
+    baseline_value = feature_vector[feat_idx]
+    for pct in np.arange(step_pct, max_pct + step_pct, step_pct):
+        fv = feature_vector.copy()
+        if direction == "decrease":
+            fv[feat_idx] = baseline_value * (1.0 - pct)
+        else:
+            fv[feat_idx] = baseline_value * (1.0 + pct)
+        pred = float(model.predict_proba(np.array([fv]))[0][1])
+        if abs(pred - baseline_pred) > 0.001:
+            return round(float(pct * 100), 1), round(pred, 4)
+    return None, None
 
 # ── Analysis Functions ────────────────────────────────────────────────────────
 
@@ -328,113 +363,142 @@ def perform_sensitivity_analysis(
     feature_names: List[str],
 ) -> List[Dict]:
     """
-    One-way sensitivity analysis on key risk features.
-
-    FIX #3 — larger perturbation step (±20% instead of ±10%) so tree boundaries
-              are more reliably crossed for lab values like WBC and CRP.
-    FIX #8 — results sorted: modifiable features first (by magnitude), then
-              non-modifiable (by magnitude).  Non-modifiable features are still
-              returned for reference but pushed to the bottom.
+    One-way sensitivity analysis with adaptive perturbation.
+ 
+    Bug 2 Fix:
+    - Features with extreme values (above clinical thresholds) use 40%
+      perturbation instead of 20% to cross XGBoost tree boundaries
+    - If still insensitive, a gradient search walks from 5% to 60% to find
+      the first threshold that actually moves the prediction
+    - insensitive_note now reports the minimum perturbation needed (if any)
     """
     if "mortality_30d" not in models:
         return []
-
+ 
     model = models["mortality_30d"]
-    baseline_pred = model.predict_proba(np.array([feature_vector]))[0][1]
-
+    X = np.array([feature_vector])
+    baseline_pred = float(model.predict_proba(X)[0][1])
+ 
     modifiable_features = {
-        "wbc":                 {"modifiable": True,  "intervention": "Antibiotic therapy"},
-        "crp":                 {"modifiable": True,  "intervention": "Anti-inflammatory treatment"},
-        "creatinine":          {"modifiable": True,  "intervention": "Hydration, medication adjustment"},
-        "albumin":             {"modifiable": True,  "intervention": "Nutritional support"},
-        "glucose":             {"modifiable": True,  "intervention": "Glycemic control"},
-        "critical_lab_count":  {"modifiable": True,  "intervention": "Targeted interventions"},
-        "age":                 {"modifiable": False, "intervention": None},
-        "comorbidity_count":   {"modifiable": False, "intervention": "Chronic disease management"},
+        "wbc":                {"modifiable": True,  "intervention": "Antibiotic therapy"},
+        "crp":                {"modifiable": True,  "intervention": "Anti-inflammatory treatment"},
+        "creatinine":         {"modifiable": True,  "intervention": "Hydration, medication adjustment"},
+        "albumin":            {"modifiable": True,  "intervention": "Nutritional support"},
+        "glucose":            {"modifiable": True,  "intervention": "Glycemic control"},
+        "critical_lab_count": {"modifiable": True,  "intervention": "Targeted interventions"},
+        "age":                {"modifiable": False, "intervention": None},
+        "comorbidity_count":  {"modifiable": False, "intervention": "Chronic disease management"},
     }
-
-    lower_is_better = {"wbc", "crp", "creatinine", "glucose", "critical_lab_count"}
+ 
     improvement_direction = {
-        "wbc":                "decrease",
-        "crp":                "decrease",
-        "creatinine":         "decrease",
-        "glucose":            "decrease",
-        "critical_lab_count": "decrease",
-        "albumin":            "increase",
-        "hemoglobin":         "increase",
-        "age":                "decrease",
-        "comorbidity_count":  "decrease",
+        "wbc": "decrease", "crp": "decrease", "creatinine": "decrease",
+        "glucose": "decrease", "critical_lab_count": "decrease",
+        "albumin": "increase", "hemoglobin": "increase",
+        "age": "decrease", "comorbidity_count": "decrease",
     }
-
-    # FIX #3 — use 20% perturbation instead of 10% to cross XGBoost tree boundaries
-    PERTURBATION = 0.20
-
+ 
     sensitivity_results = []
-
+ 
     for feat_name, feat_meta in modifiable_features.items():
         if feat_name not in feature_dict or feat_name not in feature_names:
             continue
-
-        feat_idx = feature_names.index(feat_name)
-        baseline_value = feature_vector[feat_idx]
-
-        direction = improvement_direction.get(feat_name, "decrease")
-
-        improved_vector = feature_vector.copy()
-        if direction == "decrease":
-            improved_vector[feat_idx] = baseline_value * (1.0 - PERTURBATION)
+ 
+        feat_idx      = feature_names.index(feat_name)
+        baseline_val  = feature_vector[feat_idx]
+        direction     = improvement_direction.get(feat_name, "decrease")
+ 
+        # --- Bug 2 fix: adaptive perturbation ---
+        threshold = EXTREME_VALUE_THRESHOLDS.get(feat_name)
+        if threshold is not None and baseline_val > threshold:
+            primary_pct = 0.40   # extreme value → 40%
         else:
-            improved_vector[feat_idx] = baseline_value * (1.0 + PERTURBATION)
-        improved_pred = model.predict_proba(np.array([improved_vector]))[0][1]
+            primary_pct = 0.20   # normal range → 20%
+ 
+        def _perturb(pct: float, improve: bool) -> float:
+            fv = feature_vector.copy()
+            if improve:
+                fv[feat_idx] = baseline_val * (1.0 - pct) if direction == "decrease" else baseline_val * (1.0 + pct)
+            else:
+                fv[feat_idx] = baseline_val * (1.0 + pct) if direction == "decrease" else baseline_val * (1.0 - pct)
+            return float(model.predict_proba(np.array([fv]))[0][1])
+ 
+        improved_pred  = _perturb(primary_pct, improve=True)
+        worsened_pred  = _perturb(primary_pct, improve=False)
+        sensitivity_mag = abs(round((worsened_pred - improved_pred) * 100, 2))
 
-        worsened_vector = feature_vector.copy()
-        if direction == "decrease":
-            worsened_vector[feat_idx] = baseline_value * (1.0 + PERTURBATION)
-        else:
-            worsened_vector[feat_idx] = baseline_value * (1.0 - PERTURBATION)
-        worsened_pred = model.predict_proba(np.array([worsened_vector]))[0][1]
 
+        # Bug 2 bonus: sanity check — "lower is better" features should
+        # reduce mortality when improved. Log if model produces the reverse.
+        lower_is_better_features = {"wbc", "crp", "creatinine", "glucose", "critical_lab_count"}
+        if feat_name in lower_is_better_features and improved_pred > baseline_pred:
+            print(
+                f"  [sensitivity warning] {feat_name}: improving this feature "
+                f"increased predicted mortality ({baseline_pred:.3f} → {improved_pred:.3f}). "
+                f"Likely a synthetic-data artifact in the mortality_30d model — "
+                f"do not surface this as a clinical finding."
+            )
+ 
+        # --- Bug 2 fix: gradient search fallback ---
+        model_sensitivity = "SENSITIVE" if sensitivity_mag > 0 else "INSENSITIVE"
+        insensitive_note  = None
+        min_pct_needed    = None
+ 
+        if model_sensitivity == "INSENSITIVE":
+            threshold_pct, _ = _gradient_search(
+                model, feature_vector, feat_idx, baseline_pred,
+                direction, max_pct=0.60, step_pct=0.05,
+            )
+            if threshold_pct is not None:
+                min_pct_needed   = threshold_pct
+                model_sensitivity = "INSENSITIVE_AT_PRIMARY"
+                insensitive_note  = (
+                    f"XGBoost tree boundary not crossed at {primary_pct*100:.0f}% perturbation. "
+                    f"First detectable response at ~{threshold_pct:.0f}% change — "
+                    f"clinical relevance exists; effect appears at larger perturbations."
+                )
+            else:
+                insensitive_note = (
+                    f"XGBoost model shows no sensitivity to {feat_name} across 5-60% perturbation range. "
+                    f"Feature may not be a split variable in the mortality_30d tree ensemble. "
+                    f"Clinical relevance still applies — consider this a model limitation, not a clinical finding."
+                )
+ 
         sensitivity_results.append({
-            "feature_name": feat_name,
-            "baseline_value": round(baseline_value, 2),
-            "improvement_direction": direction,
+            "feature_name":                     feat_name,
+            "baseline_value":                   round(baseline_val, 2),
+            "perturbation_pct_used":            int(primary_pct * 100),
+            "improvement_direction":             direction,
+            "risk_impact_if_improved":          {
+                "mortality_30d_change": round((improved_pred - baseline_pred) * 100, 2),
+                "new_risk":             round(improved_pred, 4),
+            },
+            "risk_impact_if_worsened":          {
+                "mortality_30d_change": round((worsened_pred - baseline_pred) * 100, 2),
+                "new_risk":             round(worsened_pred, 4),
+            },
+            # Keep old key names for backwards compat with existing callers
             "risk_impact_if_improved_20_percent": {
                 "mortality_30d_change": round((improved_pred - baseline_pred) * 100, 2),
-                "new_risk": round(improved_pred, 4),
+                "new_risk":             round(improved_pred, 4),
             },
             "risk_impact_if_worsened_20_percent": {
                 "mortality_30d_change": round((worsened_pred - baseline_pred) * 100, 2),
-                "new_risk": round(worsened_pred, 4),
+                "new_risk":             round(worsened_pred, 4),
             },
-            "modifiable": feat_meta["modifiable"],
-            "clinical_intervention": feat_meta["intervention"],
-            "sensitivity_magnitude": abs(round((worsened_pred - improved_pred) * 100, 2)),
+            "modifiable":              feat_meta["modifiable"],
+            "clinical_intervention":   feat_meta["intervention"],
+            "sensitivity_magnitude":   sensitivity_mag,
+            "model_sensitivity":       model_sensitivity,
+            "min_perturbation_pct_for_response": min_pct_needed,
+            "insensitive_note":        insensitive_note,
         })
-
-    # FIX #8 — sort: modifiable first (by magnitude descending), non-modifiable after
-    modifiable_results = sorted(
-        [r for r in sensitivity_results if r["modifiable"]],
-        key=lambda x: -x["sensitivity_magnitude"],
-    )
-    non_modifiable_results = sorted(
-        [r for r in sensitivity_results if not r["modifiable"]],
-        key=lambda x: -x["sensitivity_magnitude"],
-    )
-    ordered = modifiable_results + non_modifiable_results
-
-    # Mark features where the model showed no sensitivity
-    for r in ordered:
-        if r["sensitivity_magnitude"] == 0.0:
-            r["model_sensitivity"] = "INSENSITIVE"
-            r["insensitive_note"] = (
-                "XGBoost tree boundaries not crossed at 20% perturbation — "
-                "clinical relevance exists but model did not capture it at this threshold."
-            )
-        else:
-            r["model_sensitivity"] = "SENSITIVE"
-            r["insensitive_note"] = None
-
-    return ordered[:6]
+ 
+    # Sort: modifiable first (by magnitude), then non-modifiable
+    modifiable_r     = sorted([r for r in sensitivity_results if r["modifiable"]],
+                               key=lambda x: -x["sensitivity_magnitude"])
+    non_modifiable_r = sorted([r for r in sensitivity_results if not r["modifiable"]],
+                               key=lambda x: -x["sensitivity_magnitude"])
+    return (modifiable_r + non_modifiable_r)[:6]
 
 
 def analyze_cost_effectiveness(scenarios: List[Dict], patient_age: int) -> Dict:
@@ -477,22 +541,27 @@ def analyze_cost_effectiveness(scenarios: List[Dict], patient_age: int) -> Dict:
 
         qalys = round(treated_qol * survival_adjusted_ly, 2)
 
-        # FIX #10 — resolve cost and tag source
-        cost = scenario.get("estimated_cost_usd")
-        cost_source = "provided"
-        is_baseline = False
-
-        if scenario.get("option_id") == "C" or (not scenario.get("drugs") and not scenario.get("interventions")):
-            is_baseline = True
-            if cost is None:
-                cost = 0
-                cost_source = "imputed"
-        elif cost is None or cost == 0:
-            if any("hospitalization" in i.lower() for i in scenario.get("interventions", [])):
-                cost = 15_000
+        cost        = scenario.get("estimated_cost_usd")
+        cost_source = scenario.get("cost_source")   # already set upstream if via /simulate
+        is_baseline = (
+            scenario.get("option_id") == "C"
+            or (not scenario.get("drugs") and not scenario.get("interventions"))
+        )
+ 
+        if cost is not None and cost_source:
+            # Resolved upstream — trust it
+            cost = float(cost)
+        else:
+            # Fallback for stream path (stream_endpoints builds scenarios inline)
+            if is_baseline:
+                cost, cost_source = 0.0, "zero"
+            elif cost is None or cost == 0:
+                if any("hospitalization" in i.lower() for i in scenario.get("interventions", [])):
+                    cost, cost_source = 15_000.0, "imputed"
+                else:
+                    cost, cost_source = 500.0, "imputed"
             else:
-                cost = 500
-            cost_source = "imputed"
+                cost_source = "provided"
 
         result = {
             "option_id": scenario["option_id"],
@@ -549,8 +618,72 @@ def analyze_cost_effectiveness(scenarios: List[Dict], patient_age: int) -> Dict:
     }
 
 
-# ── LLM Narrative Builder ─────────────────────────────────────────────────────
-
+def _extract_ddi_monitoring_context(scenarios: list, recommended_id: str) -> str:
+    """
+    Build specific INR/DDI monitoring instructions from the recommended
+    scenario's safety_check interaction_alerts.
+    Bug 4 fix: generates concrete clinical actions instead of generic language.
+    """
+    rec = next((s for s in scenarios if s.get("option_id") == recommended_id), None)
+    if not rec:
+        return ""
+ 
+    safety  = rec.get("safety_check") or {}
+    ia_list = safety.get("interaction_alerts", [])
+    aa_list = safety.get("allergy_alerts", [])
+    lines   = []
+ 
+    for ia in ia_list:
+        proposed = ia.get("proposed_drug", "")
+        existing = ia.get("existing_drug", "")
+        warning  = ia.get("warning", "")
+ 
+        if "warfarin" in existing.lower():
+            if "azithromycin" in proposed.lower():
+                lines.append(
+                    f"DDI ({proposed} \u2194 {existing}): {warning}. "
+                    "REQUIRED ACTIONS: (1) Check baseline INR before prescribing. "
+                    "(2) Recheck INR at 48-72 hours after starting azithromycin. "
+                    "(3) Hold or reduce warfarin dose if INR >3.5. "
+                    "(4) Target INR 2.0-3.0 for atrial fibrillation."
+                )
+            elif any(q in proposed.lower() for q in ("levofloxacin", "moxifloxacin")):
+                lines.append(
+                    f"DDI ({proposed} \u2194 {existing}): {warning}. "
+                    "REQUIRED ACTIONS: (1) Check baseline INR before prescribing. "
+                    "(2) Recheck INR at 3-5 days. "
+                    "(3) Consider empirical 20-25% warfarin dose reduction in high-risk patients."
+                )
+            elif "ceftriaxone" in proposed.lower():
+                lines.append(
+                    f"DDI ({proposed} \u2194 {existing}): {warning}. "
+                    "REQUIRED ACTION: Recheck INR within 5-7 days of starting ceftriaxone."
+                )
+            else:
+                lines.append(
+                    f"DDI ({proposed} \u2194 {existing}): {warning}. "
+                    "REQUIRED ACTION: Monitor INR closely during co-administration."
+                )
+        elif "metformin" in (existing + proposed).lower():
+            lines.append(
+                f"DDI ({proposed} \u2194 {existing}): {warning}. "
+                "REQUIRED ACTION: Hold metformin 48h before and after iodinated contrast."
+            )
+        else:
+            lines.append(f"DDI ({proposed} \u2194 {existing}): {warning}.")
+ 
+    for aa in aa_list:
+        if aa.get("cross_reactivity"):
+            lines.append(
+                f"Cross-reactivity alert ({aa.get('drug')} \u2194 "
+                f"documented {aa.get('allergen')} allergy, {aa.get('severity')} severity): "
+                "verify tolerance before prescribing — consider allergy skin testing or "
+                "graded challenge if clinically necessary."
+            )
+ 
+    return "\n".join(lines) if lines else ""
+ 
+ 
 def build_enhanced_llm_narrative(
     patient_state: dict,
     diagnosis: str,
@@ -565,132 +698,134 @@ def build_enhanced_llm_narrative(
 ) -> str:
     """
     Generate evidence-based clinical narrative.
-
-    FIX #6 — filter sensitivity list to MODIFIABLE features only before building
-              the LLM prompt, so the narrative never suggests "improve age" as an
-              actionable intervention.
+    Bug 4 fix: MONITORING section now receives DDI-specific context and is
+    instructed to produce concrete clinical actions (INR targets, timing,
+    dose thresholds) rather than generic language.
     """
-    demo = patient_state.get("demographics", {})
-    age = demo.get("age", "?")
-    gender = demo.get("gender", "patient")
-    best = next((s for s in scenarios if s["option_id"] == recommended_option), scenarios[0] if scenarios else {})
-
-    # FIX #6 — only pass modifiable features to narrative
+    demo    = patient_state.get("demographics", {})
+    age     = demo.get("age", "?")
+    gender  = demo.get("gender", "patient")
+    best    = next((s for s in scenarios if s["option_id"] == recommended_option),
+                   scenarios[0] if scenarios else {})
+ 
     modifiable_sensitivity = [
         s for s in (sensitivity_top_3 or [])
         if s.get("modifiable", False)
     ]
-
+ 
+    # Bug 4 fix: build DDI monitoring context
+    ddi_monitoring = _extract_ddi_monitoring_context(scenarios, recommended_option)
+    monitoring_block = (
+        f"\n\nDrug interaction monitoring requirements for the recommended option:\n{ddi_monitoring}"
+        if ddi_monitoring
+        else "\n\nNo significant drug interactions detected for the recommended option."
+    )
+ 
     if not llm_ready or not llm:
         rec_label = best.get("label", recommended_option)
-        rec_7d  = best.get("predictions", {}).get("recovery_probability_7d", 0)
-        rec_mort = best.get("predictions", {}).get("mortality_risk_30d", 0)
-
+        rec_7d    = best.get("predictions", {}).get("recovery_probability_7d", 0)
+        rec_mort  = best.get("predictions", {}).get("mortality_risk_30d", 0)
+ 
         narrative = (
             f"For this {age}-year-old {gender} with {diagnosis} ({risk_profile} risk), "
             f"{rec_label} offers {rec_7d:.0%} 7-day recovery probability and "
             f"{rec_mort:.0%} 30-day mortality risk. "
         )
-
         if modifiable_sensitivity:
-            top = modifiable_sensitivity[0]
-            change_key = "risk_impact_if_improved_20_percent" if "20" in str(top.get("risk_impact_if_improved_20_percent", "")) else "risk_impact_if_improved_10_percent"
-            change = top.get(change_key, top.get("risk_impact_if_improved_20_percent", {}))
+            top    = modifiable_sensitivity[0]
+            change = top.get("risk_impact_if_improved_20_percent", {})
             narrative += (
                 f"Most modifiable risk factor: {top['feature_name']} "
                 f"(improvement reduces mortality by "
                 f"{abs(change.get('mortality_30d_change', 0)):.1f}% points). "
             )
-
         if cost_effectiveness:
             most_ce = cost_effectiveness.get("most_cost_effective")
             if most_ce == recommended_option:
                 narrative += "This option is also most cost-effective. "
-
+        if ddi_monitoring:
+            # Include first DDI action in fallback narrative
+            first_line = ddi_monitoring.split("\n")[0]
+            narrative += f"Key monitoring: {first_line} "
         narrative += "Evidence-based decision support — clinical judgment required."
         return narrative
-
-    # Build scenario lines for LLM
+ 
+    # Build scenario summary lines for the LLM
     scenario_lines = []
     for s in scenarios:
         if s["option_id"] == "C":
             continue
-        preds = s.get("predictions", {})
-        guideline_raw = s.get("guideline_adherence", {})
-
-        if isinstance(guideline_raw, list):
-            guideline = guideline_raw[0] if guideline_raw else {}
-        else:
-            guideline = guideline_raw if guideline_raw else {}
-
+        preds           = s.get("predictions", {})
+        guideline_raw   = s.get("guideline_adherence", {})
+        guideline       = (guideline_raw[0] if isinstance(guideline_raw, list) and guideline_raw
+                           else guideline_raw if isinstance(guideline_raw, dict) else {})
+ 
         adherence_note = ""
         if guideline:
             adherence = guideline.get("adherence", "")
-            if adherence == "FIRST_LINE":
-                adherence_note = " [FIRST-LINE per guidelines]"
-            elif adherence == "INPATIENT_APPROPRIATE":
-                adherence_note = " [INPATIENT guideline]"
-            elif adherence == "SECOND_LINE":
-                adherence_note = " [SECOND-LINE]"
-            elif adherence == "OFF_GUIDELINE":
-                adherence_note = " [OFF-GUIDELINE]"
-
-        # Pass safety_flag explicitly so LLM knows contraindicated options
+            adherence_note = {
+                "FIRST_LINE":           " [FIRST-LINE per guidelines]",
+                "INPATIENT_APPROPRIATE": " [INPATIENT guideline]",
+                "SECOND_LINE":           " [SECOND-LINE]",
+                "OFF_GUIDELINE":         " [OFF-GUIDELINE]",
+            }.get(adherence, "")
+ 
         safety_flag = (s.get("safety_check") or {}).get("safety_flag", "SAFE")
-        if safety_flag == "CONTRAINDICATED":
-            safety_note = " ⚠️ CONTRAINDICATED — allergy/cross-reactivity risk, DO NOT recommend"
-        elif safety_flag == "ALLERGY_RISK":
-            safety_note = " ⚠️ ALLERGY RISK — use with caution"
-        elif safety_flag == "INTERACTION_WARNING":
-            safety_note = " ⚠️ DRUG INTERACTION — monitor closely"
-        else:
-            safety_note = ""
-
+        safety_note = {
+            "CONTRAINDICATED":     " [CONTRAINDICATED — excluded from recommendation]",
+            "ALLERGY_RISK":        " [ALLERGY RISK — use with caution]",
+            "INTERACTION_WARNING": " [DDI warning — see monitoring]",
+        }.get(safety_flag, "")
+ 
         scenario_lines.append(
             f"Option {s['option_id']} ({s['label']}){adherence_note}{safety_note}: "
             f"7d recovery {preds.get('recovery_probability_7d', 0):.0%}, "
             f"30d mortality {preds.get('mortality_risk_30d', 0):.0%}, "
             f"30d readmission {preds.get('readmission_risk_30d', 0):.0%}"
         )
-
-    conditions = patient_state.get("active_conditions", [])
-    comorbidity_summary = ", ".join([c.get("display", "") for c in conditions[:3]])
-
-    # FIX #6 — only modifiable features in sensitivity context
+ 
+    conditions          = patient_state.get("active_conditions", [])
+    comorbidity_summary = ", ".join(c.get("display", "") for c in conditions[:3])
+ 
     sensitivity_context = ""
     if modifiable_sensitivity:
         sensitivity_context = "\n\nKey MODIFIABLE risk factors (clinician can intervene):\n" + "\n".join([
             f"- {s['feature_name']} ({s.get('clinical_intervention', 'intervention available')}): "
             f"20% improvement → "
-            f"{abs(s.get('risk_impact_if_improved_20_percent', s.get('risk_impact_if_improved_10_percent', {})).get('mortality_30d_change', 0)):.1f}% mortality reduction"
+            f"{abs(s.get('risk_impact_if_improved_20_percent', {}).get('mortality_30d_change', 0)):.1f}% mortality reduction"
             for s in modifiable_sensitivity[:3]
         ])
-
+ 
     cost_context = ""
     if cost_effectiveness:
-        most_ce = cost_effectiveness.get("most_cost_effective")
+        most_ce      = cost_effectiveness.get("most_cost_effective")
         cost_context = (
             f"\n\nCost-effectiveness: Option {most_ce} is most cost-effective "
             "among treatment options at current willingness-to-pay threshold."
         )
-
+ 
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a clinical decision support system generating structured clinical decision support notes. "
          "Use the following format exactly:\n\n"
          "IMPRESSION: One sentence summarizing patient risk profile and primary diagnosis.\n\n"
          "SAFETY: One sentence. If any option is CONTRAINDICATED, explicitly name it, state why "
-         "(allergy/DDI), and confirm it is excluded from recommendation.\n\n"
+         "(allergy/cross-reactivity/DDI), and confirm it is excluded from recommendation.\n\n"
          "RECOMMENDATION: One to two sentences. State the recommended option, cite its key outcome "
          "metrics (7d recovery, 30d mortality, readmission), and note guideline adherence status.\n\n"
-         "MONITORING: One sentence. List the most important clinical monitoring actions given the "
-         "patient's comorbidities and the chosen treatment's known interactions or risks.\n\n"
-         "MODIFIABLE RISK FACTORS: One sentence. Name 1-2 specific modifiable factors with their "
-         "quantified mortality impact. Do NOT mention age.\n\n"
+         "MONITORING: Two to three sentences. You MUST use the 'Drug interaction monitoring requirements' "
+         "provided below. Reference the specific drug names, the specific INR targets and recheck timing, "
+         "and the specific dose-adjustment thresholds. "
+         "FORBIDDEN phrases: 'monitor closely', 'monitor for drug interactions', 'close monitoring'. "
+         "REQUIRED format example: 'Check baseline INR before starting azithromycin; recheck at 48-72h; "
+         "hold warfarin if INR >3.5; target INR 2.0-3.0 for atrial fibrillation.'\n\n"
+         "MODIFIABLE RISK FACTORS: One sentence. Name 1-2 specific modifiable lab factors with their "
+         "quantified mortality impact from the sensitivity data. Do NOT mention age.\n\n"
          "CRITICAL RULES:\n"
          "- CONTRAINDICATED options must never appear as recommendations or alternatives.\n"
          "- All percentages must come from the simulation data provided — do not invent numbers.\n"
-         "- End every note with exactly: 'This is AI-generated decision support requiring physician validation.'"),
+         "- MONITORING must contain the exact drug names and exact thresholds from the DDI context.\n"
+         "- End with exactly: 'This is AI-generated decision support requiring physician validation.'"),
         ("human",
          f"Patient: {age}y {gender}. "
          f"Diagnosis: {diagnosis} (ICD-10: {diagnosis_code or 'not specified'}). "
@@ -699,10 +834,11 @@ def build_enhanced_llm_narrative(
          f"Treatment scenarios:\n" + "\n".join(scenario_lines) + "\n\n"
          f"Recommended: Option {recommended_option}"
          f"{sensitivity_context}"
-         f"{cost_context}\n\n"
-         "Provide evidence-based clinical narrative justifying the recommendation."),
+         f"{cost_context}"
+         f"{monitoring_block}\n\n"
+         "Generate the structured clinical decision support note."),
     ])
-
+ 
     chain = prompt | llm | StrOutputParser()
     try:
         narrative = chain.invoke({})
@@ -710,7 +846,7 @@ def build_enhanced_llm_narrative(
             narrative += " This is AI-generated decision support requiring physician validation."
         return narrative
     except Exception as e:
-        print(f"  ⚠️  LLM narrative failed: {e}")
+        print(f"  LLM narrative failed: {e}")
         return (
             f"Digital Twin simulation recommends Option {recommended_option} "
             f"based on {risk_profile} risk profile. "
