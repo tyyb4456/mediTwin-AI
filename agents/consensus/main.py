@@ -59,45 +59,43 @@ WEIGHTS = {
 
 
 # ── LangGraph State Definition ─────────────────────────────────────────────────
-# Canonical MediTwinState — all fields the graph carries
-
 class MediTwinState(TypedDict):
-    # Input
     patient_id: str
     chief_complaint: str
-
-    # Agent outputs (populated as graph executes)
     patient_state: Optional[dict]
     diagnosis_output: Optional[dict]
     lab_output: Optional[dict]
     imaging_output: Optional[dict]
     drug_safety_output: Optional[dict]
     digital_twin_output: Optional[dict]
-
-    # Consensus outputs (populated by this agent)
     detected_conflicts: Optional[list]
     consensus_status: Optional[str]
     final_assessment: Optional[dict]
     human_review_required: bool
-
-    # Control flags
     imaging_available: bool
     error_log: list
 
 
-# ── Core consensus logic (shared by LangGraph node and REST endpoint) ──────────
+# ── Core consensus logic ───────────────────────────────────────────────────────
 
 def compute_aggregate_confidence(
     diagnosis_output: Optional[dict],
     lab_output: Optional[dict],
     imaging_output: Optional[dict],
     resolution: Optional[dict],
+    conflicts: Optional[list] = None,
 ) -> float:
     """
     Weighted aggregate confidence from all agent signals.
     Never returns > 0.99 — we're never 100% certain in medicine.
+
+    FIX: Imaging penalty is only applied when imaging is NOT already flagged
+    as a conflict being escalated. If imaging is contradictory and we've
+    already escalated, we don't double-penalize the aggregate confidence —
+    the escalation flag already communicates the problem.
     """
     score = 0.0
+    conflicts = conflicts or []
 
     # Diagnosis Agent confidence (weight 0.35)
     if diagnosis_output:
@@ -112,25 +110,44 @@ def compute_aggregate_confidence(
         lab_boost = float(
             lab_output.get("diagnosis_confirmation", {}).get("lab_confidence_boost", 0.0)
         )
-        # lab_boost is a delta (e.g. 0.12) — treat it as the lab's confirmation signal
-        lab_signal = min(0.85, 0.5 + lab_boost)  # floor at 0.5 if boost is 0
+        lab_signal = min(0.85, 0.5 + lab_boost)
         score += lab_signal * WEIGHTS["lab"]
 
-    # Imaging Agent confidence (weight 0.25) — only if confirms diagnosis
+    # Imaging Agent confidence (weight 0.25)
+    # Rules:
+    #   1. If imaging CONFIRMS the diagnosis → add positive weight.
+    #   2. If imaging CONTRADICTS and that contradiction is already an escalated
+    #      conflict → skip entirely (don't double-penalize; escalation already surfaces it).
+    #   3. If imaging CONTRADICTS and is NOT escalated, only penalize when imaging
+    #      was actually clinically relevant to the diagnosis (respiratory ICD codes).
+    #      A normal CXR on a UTI is expected and should not drag down confidence.
     if imaging_output and not imaging_output.get("mock", False):
         img_confirms = imaging_output.get("confirms_diagnosis", False)
         img_conf = float(imaging_output.get("model_output", {}).get("confidence", 0.0))
+
+        imaging_already_escalated = any(
+            c.type == "imaging_clinical_dissociation"
+            for c in conflicts
+            if hasattr(c, "type")
+        )
+
+        # Is the top diagnosis one where chest imaging is clinically expected?
+        top_dx_code = (diagnosis_output or {}).get("top_icd10_code", "")
+        imaging_clinically_relevant = top_dx_code.startswith(("J", "R0", "I26", "I27"))
+
         if img_confirms:
             score += img_conf * WEIGHTS["imaging"]
-        else:
-            # Imaging contradicts — reduce score slightly
+        elif imaging_already_escalated:
+            pass  # conflict already surfaced — don't touch the score
+        elif imaging_clinically_relevant:
+            # Imaging contradicts a diagnosis it was supposed to confirm → penalize
             score -= img_conf * WEIGHTS["imaging"] * 0.3
+        # else: imaging is irrelevant to this diagnosis (e.g. UTI) → ignore result
 
     # Small bonus if system caught and resolved a conflict
     if resolution:
         score += WEIGHTS["tiebreaker"]
 
-    # Cap at 0.99 and floor at 0.30
     return round(min(max(score, 0.30), 0.99), 2)
 
 
@@ -151,6 +168,38 @@ def build_escalation_actions(conflicts: list[Conflict]) -> list[str]:
     return sorted(actions)
 
 
+def build_escalation_reason(conflicts: list[Conflict]) -> str:
+    """
+    FIX: Build a combined escalation reason that covers ALL conflicts,
+    not just conflicts[0]. Prioritizes CRITICAL drug safety issues
+    and imaging dissociation — both are patient-safety relevant.
+    """
+    if not conflicts:
+        return "Multiple agent disagreements detected"
+
+    reason_parts = []
+
+    # Surface drug safety (CRITICAL allergy/interaction) first if present
+    drug_conflicts = [c for c in conflicts if c.type == "treatment_contraindicated"]
+    imaging_conflicts = [c for c in conflicts if c.type == "imaging_clinical_dissociation"]
+    lab_conflicts = [c for c in conflicts if c.type == "diagnosis_lab_mismatch"]
+
+    if drug_conflicts:
+        reason_parts.append(drug_conflicts[0].description)
+    if imaging_conflicts:
+        reason_parts.append(imaging_conflicts[0].description)
+    if lab_conflicts:
+        reason_parts.append(lab_conflicts[0].description)
+
+    # Fallback: any other conflicts not covered above
+    covered = set(id(c) for c in drug_conflicts + imaging_conflicts + lab_conflicts)
+    for c in conflicts:
+        if id(c) not in covered:
+            reason_parts.append(c.description)
+
+    return " | ".join(reason_parts)
+
+
 def run_consensus(
     diagnosis_output: Optional[dict],
     lab_output: Optional[dict],
@@ -160,7 +209,6 @@ def run_consensus(
 ) -> dict:
     """
     Core consensus pipeline. Shared by LangGraph node and REST endpoint.
-
     Returns ConsensusOutput dict.
     """
     # Step 1: Detect conflicts
@@ -184,7 +232,6 @@ def run_consensus(
         consensus_status = "FULL_CONSENSUS"
 
     elif route == "resolve":
-        # Attempt tiebreaker RAG for the highest-severity conflict
         primary_conflict = max(
             conflicts,
             key=lambda c: {"HIGH": 2, "MODERATE": 1, "LOW": 0}.get(c.severity, 0)
@@ -194,9 +241,19 @@ def run_consensus(
         if resolution:
             consensus_status = "CONFLICT_RESOLVED"
         else:
-            # Tiebreaker unavailable — fall back to conservative escalation
+            # Tiebreaker unavailable (ChromaDB down or collection empty) —
+            # fall back to conservative escalation WITH a proper escalation_flag
             consensus_status = "ESCALATION_REQUIRED"
             human_review_required = True
+            max_sev = get_max_severity(conflicts)
+            escalation_flag = {
+                "priority": "URGENT" if max_sev == "HIGH" else "MODERATE",
+                "reason": (
+                    f"Tiebreaker RAG unavailable. Manual review required. "
+                    + build_escalation_reason(conflicts)
+                ),
+                "recommended_actions": build_escalation_actions(conflicts),
+            }
 
     elif route == "escalate":
         consensus_status = "ESCALATION_REQUIRED"
@@ -204,15 +261,19 @@ def run_consensus(
 
         escalation_actions = build_escalation_actions(conflicts)
         max_sev = get_max_severity(conflicts)
+
+        # FIX: Use build_escalation_reason() to cover ALL conflicts in the reason
         escalation_flag = {
             "priority": "URGENT" if max_sev == "HIGH" else "MODERATE",
-            "reason": conflicts[0].description if conflicts else "Multiple agent disagreements detected",
+            "reason": build_escalation_reason(conflicts),
             "recommended_actions": escalation_actions,
         }
 
     # Step 4: Aggregate confidence
+    # FIX: Pass conflicts list so imaging penalty logic knows what's already escalated
     aggregate_confidence = compute_aggregate_confidence(
-        diagnosis_output, lab_output, imaging_output, resolution
+        diagnosis_output, lab_output, imaging_output, resolution,
+        conflicts=conflicts,
     )
 
     # Step 5: Build final assessment
@@ -245,12 +306,20 @@ def run_consensus(
         )
     elif consensus_status == "CONFLICT_RESOLVED":
         summary = (
-            f"Conflict detected and resolved: {conflicts[0].description[:100]}. "
-            f"Resolution: {resolution.get('reasoning', 'Tiebreaker RAG applied')}."
+            f"Conflict detected and resolved: {conflicts[0].description.rstrip('.')}. "
+            f"Resolution: {resolution.get('reasoning', 'Tiebreaker RAG applied').rstrip('.')}."
         )
     else:
+        conflict_count = len(conflicts)
+        # Use the highest-priority conflict description for the summary (full, unsliced).
+        # The complete multi-conflict reason is already in escalation_flag.reason —
+        # no need to duplicate and truncate it here.
+        primary_reason = build_escalation_reason(conflicts)
+        # Trim trailing period from reason before appending our own sentence
+        primary_reason_clean = primary_reason.rstrip(".")
         summary = (
-            f"Escalation required: {conflicts[0].description[:120] if conflicts else 'Unresolvable conflict'}. "
+            f"Escalation required ({conflict_count} conflict(s) detected). "
+            f"{primary_reason_clean}. "
             "Human clinical review recommended before proceeding."
         )
 
@@ -267,6 +336,9 @@ def run_consensus(
         "human_review_required": human_review_required,
         "escalation_flag": escalation_flag,
         "conflict_count": len(conflicts),
+
+        # FIX: Include confidence_a and confidence_b so Explanation Agent
+        # has full conflict data without having to re-derive it
         "conflicts": [
             {
                 "type": c.type,
@@ -274,25 +346,22 @@ def run_consensus(
                 "description": c.description,
                 "agent_a": c.agent_a,
                 "output_a": c.output_a,
+                "confidence_a": round(c.confidence_a, 3),
                 "agent_b": c.agent_b,
                 "output_b": c.output_b,
+                "confidence_b": round(c.confidence_b, 3),
             }
             for c in conflicts
         ],
         "resolution": resolution,
         "consensus_summary": summary,
-        "partial_outputs_available": True,  # Always true — agents still produced output
+        "partial_outputs_available": True,
     }
 
 
 # ── LangGraph Node ─────────────────────────────────────────────────────────────
-# This is the canonical implementation — a node function for the Orchestrator's StateGraph
 
 def consensus_node(state: MediTwinState) -> dict:
-    """
-    LangGraph node function.
-    Reads all agent outputs from state, runs consensus, writes results back to state.
-    """
     result = run_consensus(
         diagnosis_output=state.get("diagnosis_output"),
         lab_output=state.get("lab_output"),
@@ -300,7 +369,6 @@ def consensus_node(state: MediTwinState) -> dict:
         drug_safety_output=state.get("drug_safety_output"),
         patient_state=state.get("patient_state"),
     )
-
     return {
         "detected_conflicts": result["conflicts"],
         "consensus_status": result["consensus_status"],
@@ -310,26 +378,13 @@ def consensus_node(state: MediTwinState) -> dict:
 
 
 def route_after_consensus(state: MediTwinState) -> str:
-    """
-    LangGraph conditional edge function.
-    Routes to explanation regardless of consensus status
-    (Explanation Agent handles all three cases including escalation).
-    """
     status = state.get("consensus_status", "FULL_CONSENSUS")
-    # Both consensus and escalation go to Explanation Agent
-    # Explanation Agent formats the output differently for each case
     if status == "ESCALATION_REQUIRED":
         return "escalation"
     return "explanation"
 
 
-# ── Minimal demo graph (for testing / documentation) ─────────────────────────
-
 def build_consensus_subgraph() -> StateGraph:
-    """
-    Minimal LangGraph graph containing just the consensus node.
-    In production this is embedded inside the Orchestrator's full graph.
-    """
     graph = StateGraph(MediTwinState)
     graph.add_node("consensus", consensus_node)
     graph.add_edge(START, "consensus")
@@ -372,7 +427,6 @@ class ConsensusResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("✓ Consensus + Escalation Agent started")
-    # Tiebreaker initializes lazily on first use
     yield
     print("✓ Consensus Agent shutdown")
 
@@ -385,14 +439,9 @@ app = FastAPI(
 )
 app.include_router(stream_router)
 
+
 @app.post("/consensus", response_model=ConsensusResponse)
 async def consensus(request: ConsensusRequest) -> ConsensusResponse:
-    """
-    Run the full consensus pipeline over all specialist agent outputs.
-
-    Detects conflicts, attempts resolution via RAG if moderate severity,
-    escalates if high severity, and returns a weighted aggregate confidence score.
-    """
     try:
         result = run_consensus(
             diagnosis_output=request.diagnosis_output,

@@ -175,16 +175,31 @@ def detect_conflicts(
         ]
 
         if safety_status == "UNSAFE" and (critical_contras or severe_interactions):
-            severity = "HIGH" if critical_contras else "MODERATE"
+            # Severity is HIGH if EITHER critical contraindications OR critical interactions exist.
+            # Previously only checked critical_contras, so a CRITICAL interaction in
+            # critical_interactions[] would incorrectly produce MODERATE severity.
+            severity = "HIGH" if (critical_contras or severe_interactions) else "MODERATE"
+
+            # FIX: Build full (untruncated) descriptions for each contraindication/interaction
             descriptions = []
             for c in critical_contras[:2]:
-                descriptions.append(
-                    f"{c.get('drug', '?')} contraindicated: {c.get('reason', '')[:80]}"
-                )
+                drug = c.get("drug", "?")
+                reason = c.get("reason", "")          # full reason — no [:80] slice
+                recommendation = c.get("recommendation", "")
+                desc = f"{drug} contraindicated: {reason}"
+                if recommendation:
+                    desc += f" Recommendation: {recommendation}"
+                descriptions.append(desc)
             for i in severe_interactions[:2]:
-                descriptions.append(
-                    f"{i.get('drug_a', '?')} + {i.get('drug_b', '?')}: {i.get('severity', '')} interaction"
-                )
+                drug_pair = f"{i.get('drug_a', '?')} + {i.get('drug_b', '?')}"
+                mechanism = i.get("mechanism", "")
+                recommendation = i.get("recommendation", "")
+                desc = f"{drug_pair}: {i.get('severity', '')} interaction."
+                if mechanism:
+                    desc += f" {mechanism}"
+                if recommendation:
+                    desc += f" Recommendation: {recommendation}"
+                descriptions.append(desc)
 
             conflicts.append(Conflict(
                 type="treatment_contraindicated",

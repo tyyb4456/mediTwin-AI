@@ -803,14 +803,52 @@ def build_enhanced_llm_narrative(
             f"\n\nCost-effectiveness: Option {most_ce} is most cost-effective "
             "among treatment options at current willingness-to-pay threshold."
         )
+
+    # Derive explicit contraindication reasons from safety_check data so the
+    # LLM copies the exact clinical reason instead of hallucinating vague text.
+    contraindication_facts: list = []
+    for s in scenarios:
+        sc = s.get("safety_check") or {}
+        if sc.get("safety_flag") != "CONTRAINDICATED":
+            continue
+        reasons: list = []
+        for alert in sc.get("allergy_alerts", []):
+            if alert.get("cross_reactivity"):
+                reasons.append(
+                    f"cross-reactivity between {alert['drug']} and documented "
+                    f"{alert['allergen']} allergy ({alert.get('severity', 'unknown')} severity)"
+                )
+            else:
+                reasons.append(
+                    f"documented {alert['allergen']} allergy "
+                    f"({alert.get('severity', 'unknown')} severity)"
+                )
+        for ia in sc.get("interaction_alerts", []):
+            sev = ia["warning"].split(":")[0]   # "MAJOR" | "MINOR" | "MODERATE"
+            reasons.append(
+                f"{sev} DDI between {ia['proposed_drug']} and {ia['existing_drug']}"
+            )
+        reason_str = "; ".join(reasons) if reasons else "safety concern"
+        contraindication_facts.append(
+            f"Option {s['option_id']} ({s['label']}) is CONTRAINDICATED "
+            f"due to: {reason_str}. It must be excluded from all recommendations."
+        )
+ 
+    contraindication_block = (
+        "\n\nCONTRAINDICATION FACTS (use these verbatim in the SAFETY section):\n"
+        + "\n".join(contraindication_facts)
+        if contraindication_facts
+        else ""
+    )
  
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a clinical decision support system generating structured clinical decision support notes. "
          "Use the following format exactly:\n\n"
          "IMPRESSION: One sentence summarizing patient risk profile and primary diagnosis.\n\n"
-         "SAFETY: One sentence. If any option is CONTRAINDICATED, explicitly name it, state why "
-         "(allergy/cross-reactivity/DDI), and confirm it is excluded from recommendation.\n\n"
+         "SAFETY: One sentence. Copy the contraindication reason VERBATIM from the "
+         "'CONTRAINDICATION FACTS' provided in the user message — do not paraphrase or generalise it. "
+         "Confirm the option is excluded from recommendation.\n\n"
          "RECOMMENDATION: One to two sentences. State the recommended option, cite its key outcome "
          "metrics (7d recovery, 30d mortality, readmission), and note guideline adherence status.\n\n"
          "MONITORING: Two to three sentences. You MUST use the 'Drug interaction monitoring requirements' "
@@ -823,6 +861,7 @@ def build_enhanced_llm_narrative(
          "quantified mortality impact from the sensitivity data. Do NOT mention age.\n\n"
          "CRITICAL RULES:\n"
          "- CONTRAINDICATED options must never appear as recommendations or alternatives.\n"
+         "- The SAFETY reason must come from the CONTRAINDICATION FACTS block — never invent one.\n"
          "- All percentages must come from the simulation data provided — do not invent numbers.\n"
          "- MONITORING must contain the exact drug names and exact thresholds from the DDI context.\n"
          "- End with exactly: 'This is AI-generated decision support requiring physician validation.'"),
@@ -833,6 +872,7 @@ def build_enhanced_llm_narrative(
          f"Risk profile: {risk_profile}.\n\n"
          f"Treatment scenarios:\n" + "\n".join(scenario_lines) + "\n\n"
          f"Recommended: Option {recommended_option}"
+         f"{contraindication_block}"        # ← NEW LINE (inject facts before sensitivity)
          f"{sensitivity_context}"
          f"{cost_context}"
          f"{monitoring_block}\n\n"

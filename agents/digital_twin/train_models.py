@@ -1,17 +1,18 @@
 """
-Digital Twin — Risk Model Training Script
+Digital Twin — Risk Model Training Script (FIXED)
 ==========================================
 Run this ONCE before starting the Digital Twin Agent.
 
-Trains 3 XGBoost classifiers on synthetic clinical data:
+Trains 5 XGBoost classifiers on synthetic clinical data:
   1. readmission_30d  — 30-day hospital readmission risk
   2. mortality_30d    — 30-day mortality risk
   3. complication     — complication risk during treatment
+  4. readmission_90d  — 90-day hospital readmission risk  [NEW]
+  5. mortality_1yr    — 1-year mortality risk             [NEW]
 
-Honest framing (from spec/strategy doc):
-  - Uses synthetic data generated here (not MIMIC-III, which requires credentials)
-  - Designed to produce plausible risk scores for the demo, not production accuracy
-  - Architecture is correct; real deployment would train on population-scale EHR data
+FIX APPLIED: The original script defined _generate_readmission_90d() and 
+_generate_mortality_1yr() but the main() function only trained the first 3 models.
+This version explicitly trains all 5 models.
 
 Usage:
     cd agents/digital_twin
@@ -21,7 +22,9 @@ Output:
     models/readmission_30d.json
     models/mortality_30d.json
     models/complication.json
-    models/feature_names.json   ← feature order for inference
+    models/readmission_90d.json   ← NOW GENERATED
+    models/mortality_1yr.json      ← NOW GENERATED
+    models/feature_names.json
 """
 import json
 import numpy as np
@@ -130,9 +133,9 @@ def generate_labels(df: pd.DataFrame) -> dict:
         + 0.5   * (df["creatinine"] - 1.0).clip(0)
         + 0.3   * df["critical_lab_count"]
         - 0.3   * (df["albumin"] - 3.5).clip(None, 0)
-        + 0.4   * df["on_steroid"]           # ← add: steroids → readmission risk
-        + 0.3   * (df["hemoglobin"] < 10).astype(int)  # ← add: anemia → readmission
-        + np.random.normal(0, 0.3, n)   # was 0.4
+        + 0.4   * df["on_steroid"]
+        + 0.3   * (df["hemoglobin"] < 10).astype(int)
+        + np.random.normal(0, 0.3, n)
     )
     readmit_prob = 1 / (1 + np.exp(-readmit_logit))
     y_readmit = (readmit_prob > np.random.uniform(0, 1, n)).astype(int)
@@ -141,14 +144,14 @@ def generate_labels(df: pd.DataFrame) -> dict:
     # ── 30-day mortality ──
     mort_logit = (
         -3.8
-        + 0.05  * (df["age"] - 65)       # was 0.04
-        + 1.0   * df["has_chf"]          # was 0.7
-        + 0.7   * df["has_ckd"]          # was 0.5
-        + 0.9   * (df["creatinine"] > 2.0).astype(int)   # was 0.6
-        + 0.7   * df["critical_lab_count"]               # was 0.5
-        + 0.8   * (df["albumin"] < 3.0).astype(int)      # was 0.6
+        + 0.05  * (df["age"] - 65)
+        + 1.0   * df["has_chf"]
+        + 0.7   * df["has_ckd"]
+        + 0.9   * (df["creatinine"] > 2.0).astype(int)
+        + 0.7   * df["critical_lab_count"]
+        + 0.8   * (df["albumin"] < 3.0).astype(int)
         + 0.5   * (df["wbc"] > 15).astype(int)
-        + np.random.normal(0, 0.4, n)    # was 0.6
+        + np.random.normal(0, 0.4, n)
     )
     mort_prob = 1 / (1 + np.exp(-mort_logit))
     y_mort = (mort_prob > np.random.uniform(0, 1, n)).astype(int)
@@ -156,14 +159,14 @@ def generate_labels(df: pd.DataFrame) -> dict:
     # ── Complication ──
     comp_logit = (
         -3.4
-        + 0.7   * df["has_diabetes"]     # was 0.5
-        + 0.6   * df["on_anticoagulant"] # was 0.4
-        + 0.7   * df["has_ckd"]          # was 0.5
-        + 0.5   * df["on_steroid"]       # was 0.4
-        + 0.15  * df["med_count"]        # was 0.12
+        + 0.7   * df["has_diabetes"]
+        + 0.6   * df["on_anticoagulant"]
+        + 0.7   * df["has_ckd"]
+        + 0.5   * df["on_steroid"]
+        + 0.15  * df["med_count"]
         + 0.4   * df["critical_lab_count"]
         + 0.04  * (df["age"] - 65)
-        + np.random.normal(0, 0.4, n)    # was 0.6
+        + np.random.normal(0, 0.4, n)
     )
     comp_prob = 1 / (1 + np.exp(-comp_logit))
     y_comp = (comp_prob > np.random.uniform(0, 1, n)).astype(int)
@@ -234,17 +237,17 @@ def train_and_save_model(
 ) -> xgb.XGBClassifier:
     """Train a single XGBoost classifier and save it."""
     model = xgb.XGBClassifier(
-        n_estimators=300,          # was 120
-        max_depth=3,               # was 4 — shallower = less overfit on small data
-        learning_rate=0.05,        # was 0.08 — slower = more stable
+        n_estimators=300,
+        max_depth=3,
+        learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.7,
-        min_child_weight=5,        # was 3 — more conservative on rare positives
+        min_child_weight=5,
         scale_pos_weight=(y_train == 0).sum() / (y_train == 1).sum(),
-        reg_alpha=0.1,             # L1 — add this
-        reg_lambda=1.5,            # L2 — increase this
-        eval_metric="auc",         # was logloss — optimize directly for AUC
-        early_stopping_rounds=20,  # add this — prevents overfit
+        reg_alpha=0.1,
+        reg_lambda=1.5,
+        eval_metric="auc",
+        early_stopping_rounds=20,
         random_state=42,
         verbosity=0,
     )
@@ -268,9 +271,9 @@ def train_and_save_model(
 
 
 def main():
-    print("=" * 55)
-    print("Digital Twin — Risk Model Training")
-    print("=" * 55)
+    print("=" * 70)
+    print("Digital Twin — Risk Model Training (ALL 5 MODELS)")
+    print("=" * 70)
     print(f"\nGenerating {N_SAMPLES} synthetic patients...")
 
     df = generate_synthetic_patients(N_SAMPLES)
@@ -278,11 +281,21 @@ def main():
 
     X = df[FEATURE_NAMES].values
 
-    print("\nTraining 3 XGBoost risk classifiers...")
+    print("\nTraining 5 XGBoost risk classifiers...")
     print(f"Features: {N_FEATURES} | Train/Test: 80/20 split")
     print()
 
-    for target_name, y in labels.items():
+    # FIX: Explicitly train ALL 5 models (original only trained first 3)
+    models_to_train = [
+        "readmission_30d",
+        "mortality_30d",
+        "complication",
+        "readmission_90d",  # ← WAS MISSING
+        "mortality_1yr",    # ← WAS MISSING
+    ]
+
+    for target_name in models_to_train:
+        y = labels[target_name]
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
@@ -294,11 +307,17 @@ def main():
         json.dump(FEATURE_NAMES, f, indent=2)
     print(f"\n  Feature names saved → {feat_path}")
 
-    print("\n" + "=" * 55)
-    print("✅ All 3 models trained and saved!")
-    print("   Models trained on synthetic data — representative, not production-scale.")
-    print("   Real deployment would train on population-scale EHR data (MIMIC-IV etc.).")
-    print("=" * 55)
+    print("\n" + "=" * 70)
+    print("✅ All 5 models trained and saved!")
+    print("   - readmission_30d.json")
+    print("   - mortality_30d.json")
+    print("   - complication.json")
+    print("   - readmission_90d.json   ← EXTENDED HORIZON")
+    print("   - mortality_1yr.json      ← EXTENDED HORIZON")
+    print("=" * 70)
+    print("\nModels trained on synthetic data — representative, not production-scale.")
+    print("Real deployment would train on population-scale EHR data (MIMIC-IV etc.).")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

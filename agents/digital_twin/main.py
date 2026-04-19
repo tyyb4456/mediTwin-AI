@@ -1,16 +1,32 @@
 """
-Agent 6: Digital Twin Agent — main.py
+Agent 6: Digital Twin Agent — main.py (ENHANCED - P0/P1 FIXES)
 FastAPI app, lifespan startup, XGBoost inference, and HTTP endpoints.
 Port: 8006
 
-Fixes applied:
-  #2  CI asymmetry: bootstrap clipping no longer forces upper==point_estimate.
-      Symmetric ±half-width is applied from the bootstrap percentile span.
-  #5  CONTRAINDICATED safety_flag now blocks recommendation selection.
-  #7  CI float precision: round(..., 4) applied to all predictions_with_ci.
-  #9  provenance.prediction_horizons now reflects requested horizons vs available.
-  #10 Imputed cost written back to scenario.estimated_cost_usd.
+P0 FIXES APPLIED:
+  #1 - 90d/1yr model loading verified (requires fixed train_models.py)
+  #2 - Pharmacokinetic dose adjustments added to scenarios
+
+P1 FIXES APPLIED:
+  #1 - CURB-65 / Charlson scores surfaced in simulation_summary
+  #2 - Drug combination synergy effects explained in scenarios
 """
+
+try:
+    import db
+    from db import save_simulation, SimulationRecord
+    _db_available = True
+except ImportError:
+    _db_available = False
+    print("⚠️  Database module not available - persistence disabled")
+
+from temporal_effects import (
+    predict_temporal_trajectory,
+    get_treatment_profile_key,
+    add_temporal_effects_to_scenario,
+)
+
+
 import os
 import sys
 import json
@@ -37,6 +53,8 @@ from simulator import (
     simulate_treatment,
     determine_patient_risk_profile,
     select_recommended_option,
+    COMBINATION_EFFECTS,  # ← P1 FIX: import for synergy detection
+    estimate_drug_half_life_adjustment,  # ← P0 FIX #2: import PK function
 )
 from model import (
     TreatmentOption,
@@ -93,6 +111,335 @@ def sanitize(obj):
         return bool(obj)
     return obj
 
+async def _save_simulation_to_db(
+    request_id: str,
+    patient_state: dict,
+    request: "DigitalTwinRequest",
+    response: "DigitalTwinResponse",
+    elapsed_ms: int,
+) -> tuple[bool, Optional[int]]:
+    """
+    Save simulation to database and return (success, row_id).
+    Non-blocking - failures are logged but don't break the API response.
+    """
+    if not _db_available:
+        return False, None
+    
+    try:
+        record = SimulationRecord(
+            request_id=request_id,
+            patient_id=patient_state.get("patient_id", "unknown"),
+            diagnosis=request.diagnosis,
+            diagnosis_code=request.diagnosis_code,
+            patient_risk_profile=response.simulation_summary["patient_risk_profile"],
+            baseline_mortality_30d=response.simulation_summary["baseline_risks"]["mortality_30d"],
+            baseline_readmission_30d=response.simulation_summary["baseline_risks"]["readmission_30d"],
+            baseline_complication=response.simulation_summary["baseline_risks"]["complication"],
+            recommended_option=response.simulation_summary["recommended_option"],
+            recommendation_confidence=response.simulation_summary["recommendation_confidence"],
+            model_confidence=response.model_confidence,
+            treatment_options_count=len(request.treatment_options),
+            scenarios=response.scenarios,
+            simulation_summary=response.simulation_summary,
+            what_if_narrative=response.what_if_narrative,
+            fhir_care_plan=response.fhir_care_plan,
+            feature_attribution=response.feature_attribution,
+            sensitivity_analysis=response.sensitivity_analysis,
+            cost_effectiveness=response.cost_effectiveness_summary,
+            models_loaded=response.models_loaded,
+            cache_hit=False,
+            elapsed_ms=elapsed_ms,
+            source="simulate",
+        )
+        
+        row_id = await save_simulation(record)
+        return (row_id is not None), row_id
+    
+    except Exception as e:
+        print(f"⚠️  Database save failed (non-fatal): {e}")
+        return False, None
+ 
+
+# ── P1 FIX: Clinical Risk Score Calculator ───────────────────────────────────
+
+def calculate_clinical_risk_scores(patient_state: dict, feature_dict: dict) -> dict:
+    """
+    P1 FIX: Calculate CURB-65 and Charlson scores from patient state.
+    Returns dict with scores, interpretations, and clinical recommendations.
+    """
+    from feature_engineering import _calculate_curb65_score, _calculate_charlson_index
+    
+    demographics = patient_state.get("demographics", {})
+    conditions = patient_state.get("active_conditions", [])
+    
+    age = demographics.get("age", 65)
+    wbc = feature_dict.get("wbc", 8.0)
+    creatinine = feature_dict.get("creatinine", 1.0)
+    
+    curb65_score = _calculate_curb65_score(
+        age=int(age),
+        wbc=wbc,
+        creatinine=creatinine,
+    )
+    
+    charlson_index = _calculate_charlson_index(
+        conditions=conditions,
+        age=int(age),
+    )
+    
+    # CURB-65 interpretation
+    if curb65_score == 0:
+        curb65_interpretation = "LOW RISK — outpatient management appropriate"
+        curb65_mortality = "0.6%"
+    elif curb65_score == 1:
+        curb65_interpretation = "LOW RISK — outpatient or short observation"
+        curb65_mortality = "2.7%"
+    elif curb65_score == 2:
+        curb65_interpretation = "MODERATE RISK — consider hospital admission"
+        curb65_mortality = "6.8%"
+    elif curb65_score == 3:
+        curb65_interpretation = "HIGH RISK — hospitalization recommended"
+        curb65_mortality = "14.0%"
+    else:  # 4-5
+        curb65_interpretation = "SEVERE RISK — ICU consideration, possible sepsis"
+        curb65_mortality = "27.8% (score 4) or 50%+ (score 5)"
+    
+    # Charlson interpretation
+    if charlson_index <= 1:
+        charlson_interpretation = "LOW comorbidity burden — 10-year mortality ~10%"
+    elif charlson_index <= 3:
+        charlson_interpretation = "MODERATE comorbidity burden — 10-year mortality ~25-50%"
+    elif charlson_index <= 5:
+        charlson_interpretation = "HIGH comorbidity burden — 10-year mortality ~50-75%"
+    else:
+        charlson_interpretation = "SEVERE comorbidity burden — 10-year mortality >75%"
+    
+    return {
+        "curb65": {
+            "score": curb65_score,
+            "interpretation": curb65_interpretation,
+            "30d_mortality_estimate": curb65_mortality,
+        },
+        "charlson": {
+            "score": charlson_index,
+            "interpretation": charlson_interpretation,
+        },
+    }
+
+
+# ── P0 FIX #2: Pharmacokinetic Dose Adjustment Calculator ─────────────────────
+
+def calculate_pk_adjustments(
+    drugs: List[str],
+    patient_state: dict,
+    feature_dict: dict,
+) -> List[Dict]:
+    """
+    P0 FIX #2: Calculate pharmacokinetic dose adjustments for renally/hepatically cleared drugs.
+    Returns list of adjustment recommendations with rationales.
+    """
+    adjustments = []
+    
+    demographics = patient_state.get("demographics", {})
+    age = demographics.get("age", 65)
+    creatinine = feature_dict.get("creatinine", 1.0)
+    
+    # Estimate eGFR using simplified Cockcroft-Gault
+    # eGFR ≈ (140 - age) × weight / (72 × Cr)
+    # Assume average weight 70kg
+    egfr_estimate = (140 - age) * 70 / (72 * max(creatinine, 0.6))
+    
+    # CKD staging
+    if egfr_estimate >= 60:
+        ckd_stage = "Normal/Stage 1-2"
+        renal_function = "normal"
+    elif egfr_estimate >= 45:
+        ckd_stage = "Stage 3a (mild-moderate)"
+        renal_function = "mildly_impaired"
+    elif egfr_estimate >= 30:
+        ckd_stage = "Stage 3b (moderate-severe)"
+        renal_function = "moderately_impaired"
+    elif egfr_estimate >= 15:
+        ckd_stage = "Stage 4 (severe)"
+        renal_function = "severely_impaired"
+    else:
+        ckd_stage = "Stage 5 (end-stage)"
+        renal_function = "end_stage"
+    
+    # Check for hepatic impairment (albumin as proxy)
+    albumin = feature_dict.get("albumin", 3.8)
+    hepatic_impaired = albumin < 3.0
+
+    current_meds = patient_state.get("medications", [])
+    for med in current_meds:
+        med_name = med.get("drug", "")
+        
+        # Check if current med interacts with proposed drugs
+        if "warfarin" in med_name.lower():
+            coprescribed_with_azithro = any("azithromycin" in d.lower() for d in drugs)
+            coprescribed_with_fluoroquinolone = any(
+                fq in d.lower() for fq in ["levofloxacin", "moxifloxacin"] for d in drugs
+            )
+            
+            if coprescribed_with_azithro:
+                adjustments.append({
+                    "drug": med_name,
+                    "standard_dose": "5mg daily (individualized to INR)",
+                    "adjusted_dose": "Reduce by 20-30% empirically OR hold 1-2 doses",
+                    "rationale": "Azithromycin CYP3A4 inhibition increases warfarin effect — expect 20-40% INR rise",
+                    "monitoring": "Check baseline INR, recheck at 48-72h, target INR 2.0-3.0 for AF",
+                })
+    
+    # Drug-specific adjustments
+    for drug in drugs:
+        drug_lower = drug.lower()
+        adjustment = None
+        
+        # Levofloxacin / Moxifloxacin (fluoroquinolones - renally cleared)
+        if "levofloxacin" in drug_lower or "moxifloxacin" in drug_lower:
+            if renal_function == "normal":
+                adjustment = {
+                    "drug": drug,
+                    "standard_dose": "750mg once daily (levofloxacin) or 400mg once daily (moxifloxacin)",
+                    "adjusted_dose": "No adjustment needed",
+                    "rationale": f"Normal renal function (eGFR ~{egfr_estimate:.0f} mL/min)",
+                }
+            elif renal_function == "mildly_impaired":
+                adjustment = {
+                    "drug": drug,
+                    "standard_dose": "750mg once daily",
+                    "adjusted_dose": "750mg loading dose, then 500mg daily",
+                    "rationale": f"CKD {ckd_stage} — 33% dose reduction recommended",
+                }
+            else:
+                adjustment = {
+                    "drug": drug,
+                    "standard_dose": "750mg once daily",
+                    "adjusted_dose": "500mg loading dose, then 250mg daily",
+                    "rationale": f"CKD {ckd_stage} — 50% dose reduction required",
+                }
+        
+        # Ceftriaxone (minimal renal adjustment but interaction with calcium)
+        elif "ceftriaxone" in drug_lower:
+            adjustment = {
+                "drug": drug,
+                "standard_dose": "1-2g IV once daily",
+                "adjusted_dose": "No adjustment needed" if egfr_estimate > 30 else "Monitor closely",
+                "rationale": f"Ceftriaxone safe in mild-moderate renal impairment (eGFR ~{egfr_estimate:.0f})",
+                "warning": "Avoid calcium-containing IV solutions (risk of precipitation)" if "iv" in drug_lower else None,
+            }
+        
+        # Azithromycin (hepatically cleared - caution in liver disease)
+        elif "azithromycin" in drug_lower:
+            if hepatic_impaired:
+                adjustment = {
+                    "drug": drug,
+                    "standard_dose": "500mg daily",
+                    "adjusted_dose": "Use with caution — consider 3-day course instead of 5-day",
+                    "rationale": f"Hepatic impairment suspected (albumin {albumin:.1f} g/dL) — azithromycin hepatically metabolized",
+                    "monitoring": "Monitor LFTs, watch for cholestatic jaundice",
+                }
+            else:
+                adjustment = {
+                    "drug": drug,
+                    "standard_dose": "500mg daily",
+                    "adjusted_dose": "No adjustment needed",
+                    "rationale": f"Normal hepatic function (albumin {albumin:.1f} g/dL), no renal adjustment required",
+                }
+        
+        # Warfarin (monitor INR with any antibiotic)
+        elif "warfarin" in drug_lower:
+            # Check if co-prescribed with azithromycin
+            coprescribed_with_azithro = any("azithromycin" in d.lower() for d in drugs)
+            coprescribed_with_fluoroquinolone = any(
+                fq in d.lower() for fq in ["levofloxacin", "moxifloxacin"] for d in drugs
+            )
+            
+            if coprescribed_with_azithro:
+                adjustment = {
+                    "drug": drug,
+                    "standard_dose": "5mg daily (individualized to INR)",
+                    "adjusted_dose": "Reduce by 20-30% empirically OR hold 1-2 doses",
+                    "rationale": "Azithromycin CYP3A4 inhibition increases warfarin effect — expect 20-40% INR rise",
+                    "monitoring": "Check baseline INR, recheck at 48-72h, target INR 2.0-3.0 for AF",
+                }
+            elif coprescribed_with_fluoroquinolone:
+                adjustment = {
+                    "drug": drug,
+                    "standard_dose": "5mg daily",
+                    "adjusted_dose": "Reduce by 10-20% OR monitor INR closely",
+                    "rationale": "Fluoroquinolones may potentiate warfarin anticoagulation",
+                    "monitoring": "Recheck INR at 3-5 days",
+                }
+        
+        if adjustment:
+            adjustments.append(adjustment)
+    
+    return adjustments
+
+
+# ── P1 FIX: Combination Synergy Detector ──────────────────────────────────────
+
+def detect_combination_synergy(drugs: List[str]) -> Optional[Dict]:
+    """
+    P1 FIX: Detect drug combination synergy effects and explain the mechanism.
+    Returns synergy details or None if no synergy detected.
+    
+    BUGFIX: Corrected index tracking in pairwise loop to properly reference original drug names.
+    """
+    drug_keys = [drug.lower().split()[0].rstrip(".,") for drug in drugs]
+    
+    # Normalize combination drug names
+    for i, key in enumerate(drug_keys):
+        if "clavulanate" in drugs[i].lower() and "amoxicillin" in drugs[i].lower():
+            drug_keys[i] = "amoxicillin-clavulanate"
+    
+    # Check all pairwise combinations
+    for i, drug_a in enumerate(drug_keys):
+        for j, drug_b in enumerate(drug_keys[i+1:], start=i+1):  # Track actual index
+            pair = tuple(sorted([drug_a, drug_b]))
+            combo_effect = COMBINATION_EFFECTS.get(pair)
+            
+            if combo_effect:
+                # Found synergy
+                return {
+                    "synergy_detected": True,
+                    "drug_combination": f"{drugs[i]} + {drugs[j]}",  # Use correct indices
+                    "mechanism": _get_synergy_mechanism(drug_a, drug_b),
+                    "additional_mortality_reduction": combo_effect.get("mortality_30d", 0),
+                    "additional_complication_reduction": combo_effect.get("complication", 0),
+                    "additional_recovery_days": combo_effect.get("recovery_days", 0),
+                    "evidence_level": _get_evidence_level(drug_a, drug_b),
+                }
+    
+    return None
+
+
+def _get_synergy_mechanism(drug_a: str, drug_b: str) -> str:
+    """Return clinical explanation of synergy mechanism."""
+    pair = tuple(sorted([drug_a, drug_b]))
+    
+    mechanisms = {
+        ("azithromycin", "ceftriaxone"): "Beta-lactam + macrolide dual coverage — ceftriaxone targets cell wall synthesis, azithromycin inhibits protein synthesis. Guideline-recommended combination for severe CAP.",
+        ("azithromycin", "amoxicillin-clavulanate"): "Beta-lactam/beta-lactamase inhibitor + macrolide — broader spectrum coverage with atypical pathogen activity.",
+        ("azithromycin", "prednisone"): "Antibiotic + corticosteroid — steroid reduces inflammatory response, accelerates clinical resolution but may slightly increase infection complications.",
+        ("iv fluids", "*"): "Supportive care synergy — adequate hydration improves antibiotic distribution and renal clearance of toxins.",
+    }
+    
+    return mechanisms.get(pair, f"Synergistic effect between {drug_a} and {drug_b} from combination therapy")
+
+
+def _get_evidence_level(drug_a: str, drug_b: str) -> str:
+    """Return evidence strength for combination."""
+    pair = tuple(sorted([drug_a, drug_b]))
+    
+    if pair in [("azithromycin", "ceftriaxone"), ("azithromycin", "amoxicillin-clavulanate")]:
+        return "1A (guideline-recommended combination for CAP)"
+    elif pair == ("azithromycin", "prednisone"):
+        return "1B (RCT evidence for severe CAP)"
+    else:
+        return "2C (observational evidence)"
+
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -123,9 +470,11 @@ async def lifespan(app: FastAPI):
 
             _models_loaded = True
             print(f"✓ Digital Twin: loaded {len(_models)} XGBoost risk models")
-
-            if missing:
-                print(f"  ℹ️  Optional models not found: {missing}")
+            
+            # P0 FIX #1: Explicit notification if extended models are missing
+            if "readmission_90d" in missing or "mortality_1yr" in missing:
+                print(f"  ⚠️  Extended horizon models not found: {missing}")
+                print(f"     Run train_models.py to enable 90d/1yr predictions")
 
         except Exception as e:
             _models_error = f"Model load failed: {e}"
@@ -140,7 +489,7 @@ async def lifespan(app: FastAPI):
                 max_output_tokens=2048,
             )
             _llm_ready = True
-            print("✓ Digital Twin: LLM narrative ready (Gemini 2.5 Flash Lite)")
+            print("✓ Digital Twin: LLM narrative ready (Gemini 2.5 Flash lite)")
         except Exception as e:
             print(f"⚠️  Digital Twin: LLM init failed ({e}) — narrative disabled")
     else:
@@ -161,14 +510,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="MediTwin Digital Twin Agent - Enhanced",
-    description="XGBoost risk simulation + treatment scenario comparison + clinical decision support",
-    version="2.0.0",
+    title="MediTwin Digital Twin Agent - Complete (P0/P1/P2/P3)",
+    description="XGBoost risk simulation + temporal treatment trajectories + database persistence",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
 app.include_router(stream_router)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # ── Inference Helpers ─────────────────────────────────────────────────────────
 
 def predict_with_uncertainty(
@@ -178,12 +536,7 @@ def predict_with_uncertainty(
 ) -> Tuple[float, float, float]:
     """
     Uncertainty quantification via bootstrap feature perturbation.
-
-    FIX #2: The original clipping logic forced upper_bound == point_estimate
-    whenever bootstrap samples skewed left (common for probabilities in [0.3, 0.5]).
-    The fix computes a symmetric half-width from the bootstrap span and applies it
-    symmetrically around the point estimate, so the CI is always centred and never
-    collapses to a one-sided interval.
+    Fixed symmetric CI calculation (Bug #2 from original fixes).
     """
     X = np.array([feature_vector], dtype=np.float32)
     point_est = float(model.predict_proba(X)[0][1])
@@ -201,7 +554,7 @@ def predict_with_uncertainty(
     raw_lower = float(np.percentile(bootstrap_preds, 2.5))
     raw_upper = float(np.percentile(bootstrap_preds, 97.5))
 
-    # FIX #2: use symmetric half-width so CI is always two-sided
+    # Symmetric half-width CI
     half_width = (raw_upper - raw_lower) / 2.0
     lower = max(0.0, point_est - half_width)
     upper = min(1.0, point_est + half_width)
@@ -265,30 +618,23 @@ def _generate_simulation_hash(request: DigitalTwinRequest) -> str:
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 def _resolve_option_cost(opt) -> tuple:
-    """
-    Returns (cost_usd: float, cost_source: str).
-    cost_source: "provided" | "imputed" | "zero"
-    Bug 3 fix: tracks cost origin so cost_source is never mis-tagged.
-    """
+    """Returns (cost_usd: float, cost_source: str)."""
     from simulator import DRUG_EFFECTS
  
     raw = opt.estimated_cost_usd
  
-    # Caller explicitly provided a real cost
     if raw is not None and raw > 0:
         return float(raw), "provided"
  
-    # No-treatment baseline
     if opt.option_id == "C" or (not opt.drugs and not opt.interventions):
         return 0.0, "zero"
  
-    # Impute from drug effect table + intervention heuristics
     imputed = 0.0
     for drug in opt.drugs:
         key = drug.lower().split()[0].rstrip(".,")
         if "clavulanate" in drug.lower():
             key = "amoxicillin-clavulanate"
-        imputed += DRUG_EFFECTS.get(key, {}).get("cost_usd", 50)  # $50 default
+        imputed += DRUG_EFFECTS.get(key, {}).get("cost_usd", 50)
  
     for iv in opt.interventions:
         iv_lower = iv.lower()
@@ -303,13 +649,18 @@ def _resolve_option_cost(opt) -> tuple:
         else:
             imputed += 100
  
-    imputed += 200  # baseline monitoring / labs
+    imputed += 200
     return round(imputed, 2), "imputed"
 
 # ── Main Simulation Endpoint ──────────────────────────────────────────────────
 
 @app.post("/simulate", response_model=DigitalTwinResponse)
 async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
+
+    from shared.sse_utils import Timer
+    simulation_timer = Timer()
+
+
     if not _models_loaded:
         return DigitalTwinResponse(
             simulation_summary={
@@ -358,6 +709,9 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
 
     risk_profile      = determine_patient_risk_profile(baseline_risks)
     model_confidence  = _determine_model_confidence(baseline_risks_with_ci)
+    
+    # P1 FIX #1: Calculate clinical risk scores
+    clinical_risk_scores = calculate_clinical_risk_scores(patient_state, feature_dict)
 
     # 3. Sensitivity analysis (optional)
     sensitivity_results = None
@@ -369,7 +723,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         except Exception as e:
             print(f"  ⚠️  Sensitivity analysis failed: {e}")
 
-    # 4. Prepare treatment options — ensure baseline "no treatment" exists
+    # 4. Prepare treatment options
     treatment_options = list(request.treatment_options)
     if not any(opt.option_id == "C" for opt in treatment_options):
         treatment_options.append(TreatmentOption(
@@ -380,7 +734,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             estimated_cost_usd=0,
         ))
 
-    # 5. Simulate each option + guideline check
+    # 5. Simulate each option + enhancements
     scenarios = []
     for opt in treatment_options:
         predictions = simulate_treatment(
@@ -389,7 +743,6 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             interventions=opt.interventions,
         )
 
-        # FIX #7: round all CI values to 4 d.p. consistently
         predictions_with_ci: Dict[str, Dict] = {}
         for key in ("mortality_risk_30d", "readmission_risk_30d", "complication_risk"):
             base_key = key.replace("_risk", "")
@@ -406,7 +759,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
                 "upper_bound_95ci":  round(min(1.0, point + width / 2), 4),
             }
 
-        # Guideline adherence — check ALL drugs
+        # Guideline adherence
         guideline_adherence = None
         if _tools_ready and diagnosis_code and opt.drugs:
             try:
@@ -426,7 +779,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             except Exception as e:
                 print(f"  ⚠️  Guideline check failed: {e}")
 
-        # Allergy & DDI safety check
+        # Safety check
         safety_check = None
         if _tools_ready:
             try:
@@ -439,8 +792,16 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
                 })
             except Exception as e:
                 print(f"  ⚠️  Safety check failed: {e}")
+        
+        # P0 FIX #2: Pharmacokinetic dose adjustments
+        pk_adjustments = calculate_pk_adjustments(opt.drugs, patient_state, feature_dict)
+        
+        # P1 FIX #2: Detect combination synergy
+        synergy = detect_combination_synergy(opt.drugs) if len(opt.drugs) >= 2 else None
 
-        # Key risk flags — safety alerts first
+
+
+        # Key risks
         key_risks: List[str] = []
 
         if safety_check:
@@ -471,10 +832,15 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         if not key_risks:
             key_risks.append("Low overall risk with this treatment")
 
-        # FIX #10: resolve imputed cost now and store on the scenario
         resolved_cost, cost_source = _resolve_option_cost(opt)
  
-        scenarios.append({
+        # Add temporal treatment trajectory
+        demographics = patient_state.get("demographics", {})
+        patient_age = demographics.get("age", 65)
+        comorbidity_count = int(feature_dict.get("comorbidity_count", 0))
+        critical_lab_count = int(feature_dict.get("critical_lab_count", 0))
+        
+        scenario_data = {
             "option_id":           opt.option_id,
             "label":               opt.label,
             "drugs":               opt.drugs,
@@ -486,24 +852,36 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             "safety_check":        safety_check,
             "estimated_cost_usd":  resolved_cost,
             "cost_source":         cost_source,
-        })
+            "pharmacokinetic_adjustments": pk_adjustments,
+            "combination_synergy": synergy,
+        }
+        
+        # P3 FIX: Add temporal effects if not baseline option
+        if opt.option_id != "C":
+            scenario_data = add_temporal_effects_to_scenario(
+                scenario_data,
+                baseline_risks,
+                patient_age,
+                comorbidity_count,
+                critical_lab_count,
+            )
+        
+        scenarios.append(scenario_data)
 
-    # 6. Select recommended option (exclude baseline "C")
+    # 6. Select recommended option
     patient_prefs        = request.patient_preferences or {}
     prioritize_cost      = patient_prefs.get("prioritize_cost", False)
     avoid_hospitalization = patient_prefs.get("avoid_hospitalization", False)
 
     scoreable = [s for s in scenarios if s["option_id"] != "C"]
 
-    # FIX #5: CONTRAINDICATED options are excluded from scoring entirely
     safe_scoreable = [
         s for s in scoreable
         if (s.get("safety_check") or {}).get("safety_flag") != "CONTRAINDICATED"
     ]
     if not safe_scoreable:
-        # All options are contraindicated — still score them but add a global flag
         safe_scoreable = scoreable
-        print("  ⚠️  All treatment options flagged CONTRAINDICATED — recommend manual physician review")
+        print("  ⚠️  All treatment options flagged CONTRAINDICATED")
 
     if avoid_hospitalization:
         non_hosp = [
@@ -521,7 +899,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         recommended_id  = scenarios[0]["option_id"] if scenarios else "A"
         rec_confidence  = 0.70
 
-    # 7. Cost-effectiveness analysis (optional)
+    # 7. Cost-effectiveness analysis
     cost_effectiveness = None
     if request.include_cost_analysis:
         try:
@@ -570,14 +948,13 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         prediction_confidence=model_confidence,
         diagnosis_code=diagnosis_code,
         feature_attribution=attribution,
-        model_version="2.0.0",
+        model_version="2.1.0",
     )
 
-    # FIX #9: provenance.prediction_horizons shows requested vs available
+    # Provenance with horizon tracking
     requested_horizons = request.prediction_horizons or ["7d", "30d"]
     available_horizons = list(baseline_risks_with_ci.keys())
 
-    # 7d is fulfilled if any scenario has recovery_probability_7d computed
     has_7d = any(
         s.get("predictions", {}).get("recovery_probability_7d") is not None
         for s in scenarios
@@ -595,10 +972,13 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         if horizon_map.get(h, lambda: False)()
     ]
 
+    elapsed_ms = simulation_timer.elapsed_ms()
+    
+    # Build initial provenance
     provenance = {
         "simulation_id":        simulation_hash,
         "timestamp":            datetime.now(timezone.utc).isoformat(),
-        "model_version":        "2.0.0",
+        "model_version":        "2.1.0",
         "models_used":          list(_models.keys()),
         "feature_count":        len(FEATURE_NAMES),
         "requested_horizons":   requested_horizons,
@@ -613,14 +993,21 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         "available_model_keys": available_horizons,
         "overall_confidence":   model_confidence,
         "reproducible":         True,
+        "enhancements_applied": [
+            "pharmacokinetic_dose_adjustments",
+            "clinical_risk_scores",
+            "combination_synergy_detection",
+        ],
+        "elapsed_ms": elapsed_ms,
     }
- 
 
-    return DigitalTwinResponse(
+    # Build response first
+    response = DigitalTwinResponse(
         simulation_summary=sanitize({
             "patient_risk_profile":       risk_profile,
             "baseline_risks":             {k: round(float(v), 3) for k, v in baseline_risks.items()},
             "baseline_risks_with_ci":     baseline_risks_with_ci,
+            "clinical_risk_scores":       clinical_risk_scores,  # ← P1 FIX #1
             "primary_concern":            f"{risk_profile} risk — {request.diagnosis}",
             "recommended_option":         recommended_id,
             "recommendation_confidence":  float(rec_confidence),
@@ -638,6 +1025,18 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
         mock=False,
     )
 
+    db_saved, row_id = await _save_simulation_to_db(
+        simulation_hash, patient_state, request, response, elapsed_ms
+    )
+    
+    response.provenance["database"] = {
+        "saved": db_saved,
+        "row_id": row_id,
+        "retrieval_endpoint": f"/history/request/{simulation_hash}" if db_saved else None,
+        "available": _db_available,
+    }
+    
+    return response
 
 # ── Supporting Endpoints ──────────────────────────────────────────────────────
 
@@ -645,8 +1044,8 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
 async def health():
     return {
         "status":           "healthy",
-        "agent":            "digital-twin-enhanced",
-        "version":          "2.0.0",
+        "agent":            "digital-twin-enhanced-p0-p1-p2-p3",
+        "version":          "2.2.0",  # ← Updated
         "models_loaded":    _models_loaded,
         "model_error":      _models_error,
         "models":           list(_models.keys()),
@@ -660,8 +1059,16 @@ async def health():
             "cost_effectiveness_analysis",
             "guideline_adherence_checking",
             "enhanced_fhir_provenance",
+            "pharmacokinetic_dose_adjustments",
+            "clinical_risk_scores",
+            "combination_synergy_detection",
+            "temporal_treatment_effects",      # ← P3 FIX
+            "database_persistence",             # ← P2 FIX
         ],
         "model_confidence_tracking": True,
+        "p0_p1_fixes_applied": True,
+        "p2_p3_fixes_applied": True,  # ← New flag
+        "database_available": _db_available,
     }
 
 

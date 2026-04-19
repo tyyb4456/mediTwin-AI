@@ -35,14 +35,18 @@ class ConsensusStreamRequest(BaseModel):
 async def _consensus_stream(req: ConsensusStreamRequest) -> AsyncIterator[str]:
     node  = "consensus"
     timer = Timer()
- 
+
+    # Step 1 — kick off
     yield evt_status(node, "Starting conflict detection across all agent outputs...",
                      step=1, total=3)
- 
-    from main import run_consensus  # the core consensus function in consensus/main.py
- 
-    yield evt_status(node, "Running conflict detection rules...", step=1, total=3)
- 
+
+    from main import run_consensus
+
+    # Step 2 — running the pipeline (this is where the work actually happens,
+    # including the tiebreaker RAG call if needed)
+    yield evt_status(node, "Running conflict detection and tiebreaker resolution...",
+                     step=2, total=3)
+
     try:
         result = await asyncio.to_thread(
             run_consensus,
@@ -53,20 +57,44 @@ async def _consensus_stream(req: ConsensusStreamRequest) -> AsyncIterator[str]:
     except Exception as exc:
         yield evt_error(node, f"Consensus pipeline failed: {exc}", fatal=True)
         return
- 
+
     status    = result.get("consensus_status", "UNKNOWN")
     conflicts = result.get("conflict_count", 0)
     conf      = result.get("aggregate_confidence", 0)
- 
+    resolution = result.get("resolution")
+
+    # Step 3 — summarize what happened
     if conflicts == 0:
-        yield evt_progress(node, f"No conflicts — FULL_CONSENSUS at {conf:.0%}", pct=80)
+        progress_msg = f"No conflicts detected — FULL_CONSENSUS at {conf:.0%} aggregate confidence"
     elif status == "CONFLICT_RESOLVED":
-        yield evt_progress(node, f"{conflicts} conflict(s) resolved via RAG tiebreaker", pct=80)
+        method = resolution.get("resolution_method", "TIEBREAKER_RAG") if resolution else "TIEBREAKER_RAG"
+        resolved_dx = resolution.get("resolved_diagnosis_display", "") if resolution else ""
+        progress_msg = (
+            f"{conflicts} conflict(s) resolved via {method}. "
+            f"Final diagnosis: {resolved_dx} ({conf:.0%} confidence)"
+        )
+    elif status == "ESCALATION_REQUIRED":
+        escalation_flag = result.get("escalation_flag") or {}
+        priority = escalation_flag.get("priority", "MODERATE")
+        # Distinguish tiebreaker fallback from genuine high-severity escalation
+        reason = escalation_flag.get("reason", "")
+        if "Tiebreaker RAG unavailable" in reason:
+            progress_msg = (
+                f"{conflicts} conflict(s) detected. RAG resolution unavailable — "
+                f"escalating to human review (priority: {priority})"
+            )
+        else:
+            progress_msg = (
+                f"{conflicts} conflict(s) detected — escalating to human review "
+                f"(priority: {priority})"
+            )
     else:
-        yield evt_progress(node,
-                           f"{conflicts} conflict(s) detected — escalating to human review",
-                           pct=80)
- 
+        progress_msg = f"Consensus complete: {status}"
+
+    yield evt_progress(node, progress_msg, pct=90)
+
+    # Step 3 complete — emit final result
+    yield evt_status(node, "Building final consensus output...", step=3, total=3)
     yield evt_complete(node, result, elapsed_ms=timer.elapsed_ms())
  
  
@@ -77,5 +105,3 @@ async def consensus_stream(request: ConsensusStreamRequest):
             yield chunk
         yield sse_done()
     return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)
- 
- 
