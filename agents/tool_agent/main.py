@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from agent import build_tool_agent
+from stream_endpoint import router as stream_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +65,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(stream_router)
 
 
 # ── Request model ──────────────────────────────────────────────────────────────
@@ -104,23 +107,34 @@ def _extract_final_answer(messages: list) -> str:
 
 
 def _extract_tools_called(messages: list) -> list[str]:
-    """Return deduplicated list of tool names that were called, in order."""
+    """Return deduplicated list of tool names called, in order."""
     seen = []
     for msg in messages:
-        if isinstance(msg, ToolMessage):
-            name = getattr(msg, "name", None)
-            if name and name not in seen:
-                seen.append(name)
+        if isinstance(msg, AIMessage):
+            for tc in getattr(msg, "tool_calls", []):
+                name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                if name and name not in seen:
+                    seen.append(name)
     return seen
 
 
 def _extract_tool_outputs(messages: list) -> dict:
     """Return last output per tool as parsed dict (for structured consumers)."""
     import json
+    # Build a map from tool_call_id → tool name via AIMessage.tool_calls
+    id_to_name: dict = {}
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            for tc in getattr(msg, "tool_calls", []):
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                if tc_id and tc_name:
+                    id_to_name[tc_id] = tc_name
+
     outputs = {}
     for msg in messages:
         if isinstance(msg, ToolMessage):
-            name = getattr(msg, "name", "unknown")
+            name = id_to_name.get(getattr(msg, "tool_call_id", ""), "unknown")
             try:
                 outputs[name] = json.loads(msg.content)
             except Exception:
@@ -185,12 +199,12 @@ async def query(request: QueryRequest) -> JSONResponse:
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    tools = _agent.tools if _agent else []
+    from tools import MEDITWIN_TOOLS
     return JSONResponse(content={
         "status":          "healthy" if _agent else "initializing",
         "mode":            "conservative_react",
-        "tools_available": [t.name for t in tools],
-        "tool_count":      len(tools),
+        "tools_available": [t.name for t in MEDITWIN_TOOLS],
+        "tool_count":      len(MEDITWIN_TOOLS),
         "memory_enabled":  True,
         "version":         "1.0.0",
     })
@@ -200,7 +214,8 @@ async def health() -> JSONResponse:
 
 @app.get("/.well-known/agent-card")
 async def agent_card() -> JSONResponse:
-    tools = _agent.tools if _agent else []
+    from tools import MEDITWIN_TOOLS
+    tools = MEDITWIN_TOOLS
     return JSONResponse(content={
         "name":    "MediTwin Tool Agent",
         "version": "1.0.0",

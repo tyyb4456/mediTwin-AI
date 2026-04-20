@@ -2,22 +2,7 @@
 MediTwin Tool Agent — LangGraph ReAct Agent
 Port: 8010
 
-This is a CONSERVATIVE tool-calling agent. It uses tools only when needed:
-
-  TRIAGE LOGIC (decided by the LLM via system prompt):
-  ┌────────────────────────────────────────────────────────────┐
-  │  Query contains a patient ID?                              │
-  │                                                            │
-  │  YES → fetch_patient_context first, then call ONLY the     │
-  │         tools relevant to what the user is asking about    │
-  │                                                            │
-  │  NO  → answer from general medical knowledge, no tools     │
-  └────────────────────────────────────────────────────────────┘
-
-This is intentionally different from the Orchestrator (port 8000):
-  - Orchestrator: deterministic, always runs all 8 agents in fixed order
-  - Tool Agent:   LLM decides scope — minimal tools for focused queries,
-                  zero tools for general medical questions
+CONSERVATIVE tool-calling agent with FIXED tool chaining logic.
 """
 import os
 import sys
@@ -28,7 +13,7 @@ from langchain.agents import create_agent
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from dotenv import load_dotenv
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from tools import MEDITWIN_TOOLS
@@ -36,7 +21,7 @@ from tools import MEDITWIN_TOOLS
 logger = logging.getLogger("meditwin.tool_agent.agent")
 
 
-# ── System prompt — triage logic lives here ───────────────────────────────────
+# ── System prompt — FIXED tool chaining instructions ──────────────────────────
 SYSTEM_PROMPT = """You are MediTwin AI, a clinical decision support assistant backed by 8 specialist AI agents.
 
 ═══════════════════════════════════════════════════════════
@@ -63,27 +48,34 @@ Query asks about...                       → Tools to call
 ─────────────────────────────────────────────────────────
 Diagnosis / what's wrong / ICD-10         → run_diagnosis
 Lab results / blood work / abnormals      → analyze_labs
-Medications / drug safety / interactions  → check_drug_safety (with proposed meds extracted from query)
+Medications / drug safety / interactions  → check_drug_safety (with proposed meds)
 X-ray / imaging (+ image provided)        → analyze_chest_xray
 Prognosis / treatment comparison          → run_diagnosis + simulate_treatment_outcomes
 Full clinical assessment / SOAP note      → run_diagnosis + analyze_labs + run_consensus + generate_clinical_report
 Complete workup (explicit request)        → all relevant tools + run_consensus + generate_clinical_report
 
-IMPORTANT — Do NOT call:
-  - analyze_chest_xray unless an actual image is in the conversation
-  - simulate_treatment_outcomes unless asked about outcomes/prognosis
-  - run_consensus unless preparing a final validated report
-  - generate_clinical_report unless the user asks for a written report/note
-
 ═══════════════════════════════════════════════════════════
-TOOL CHAINING RULES
+CRITICAL FIX: TOOL CHAINING RULES
 ═══════════════════════════════════════════════════════════
 
 1. fetch_patient_context is ALWAYS the first tool call (Case B only)
-2. Pass the raw JSON string output of each tool directly into the next tool
-3. Never parse or summarize tool output before passing it to another tool
-4. proposed_medications for check_drug_safety must be extracted from the user's query
-   (e.g. if user asks "is amoxicillin safe?" → proposed_medications=["Amoxicillin"])
+
+2. **Tool outputs are Python dicts. Pass them DIRECTLY to downstream tools.**
+   The result of fetch_patient_context IS the patient_state — do not wrap it,
+   do not nest it, do not add any key around it.
+
+   CORRECT:
+     patient_state = fetch_patient_context(patient_id="example")
+     diagnosis = run_diagnosis(patient_state=patient_state, chief_complaint="fever")
+
+   WRONG — never do this:
+     run_diagnosis(patient_state={"fetch_patient_context_response": patient_state}, ...)
+     run_diagnosis(patient_state={"patient_state": patient_state}, ...)
+
+3. For check_drug_safety, extract proposed_medications from the user's query as a list of strings.
+   Example: If user asks "is amoxicillin safe?" → proposed_medications=["Amoxicillin"]
+
+4. Never wrap, serialize, or modify tool output before passing it to another tool — pass as-is.
 
 ═══════════════════════════════════════════════════════════
 RESPONSE FORMAT
@@ -98,17 +90,9 @@ After tool calls are complete:
 Always be concise. Do not repeat raw JSON in your response.
 """
 
-
 async def build_tool_agent(checkpointer):
-    """
-    Build and return the MediTwin Tool Agent with PostgreSQL checkpointer.
-    Uses create_react_agent from langgraph.prebuilt (recommended 2025 pattern).
-    """
-    db_uri = os.getenv(
-        "POSTGRES_CHECKPOINT_URI",
-        "postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints"
-    )
-
+    """Build and return the MediTwin Tool Agent with PostgreSQL checkpointer."""
+    
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash-lite",
         google_api_key=os.getenv("GOOGLE_API_KEY"),
