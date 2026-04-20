@@ -99,7 +99,7 @@ Always be concise. Do not repeat raw JSON in your response.
 """
 
 
-async def build_tool_agent():
+async def build_tool_agent(checkpointer):
     """
     Build and return the MediTwin Tool Agent with PostgreSQL checkpointer.
     Uses create_react_agent from langgraph.prebuilt (recommended 2025 pattern).
@@ -116,23 +116,22 @@ async def build_tool_agent():
         convert_system_message_to_human=True,
     )
 
-    async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
-        try:
-            await checkpointer.setup()
-            logger.info("✓ Tool Agent: PostgreSQL checkpointer initialized")
-        except Exception as e:
-            logger.warning(f"Checkpointer setup: {e} (tables may already exist)")
+    try:
+        await checkpointer.setup()
+        logger.info("✓ PostgreSQL checkpointer initialized")
+    except Exception as e:
+        logger.warning(f"Checkpointer setup: {e} (tables may already exist)")
 
-        agent = create_agent(
-            model=llm,
-            tools=MEDITWIN_TOOLS,
-            system_prompt=SYSTEM_PROMPT,
-            checkpointer=checkpointer,
-        )
+    agent = create_agent(
+        model=llm,
+        tools=MEDITWIN_TOOLS,
+        system_prompt=SYSTEM_PROMPT,
+        checkpointer=checkpointer,
+    )
 
-        logger.info(f"✓ MediTwin Tool Agent built — {len(MEDITWIN_TOOLS)} tools available")
-        logger.info("  Conservative mode: tools called only when patient ID present and relevant")
-        for t in MEDITWIN_TOOLS:
-            logger.info(f"   • {t.name}")
+    logger.info(f"✓ MediTwin Tool Agent built — {len(MEDITWIN_TOOLS)} tools available")
+    logger.info("  Conservative mode: tools called only when patient ID present and relevant")
+    for t in MEDITWIN_TOOLS:
+        logger.info(f"   • {t.name}")
 
-        return agent
+    return agent

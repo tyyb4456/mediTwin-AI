@@ -33,18 +33,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("meditwin.tool_agent")
 
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver 
+
 # ── Global agent instance ──────────────────────────────────────────────────────
 _agent = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _agent
-    logger.info("MediTwin Tool Agent starting...")
-    _agent = await build_tool_agent()
-    logger.info("✓ MediTwin Tool Agent ready on port 8010")
-    yield
-    logger.info("✓ MediTwin Tool Agent shutdown")
+    db_uri = os.getenv(
+        "POSTGRES_CHECKPOINT_URI",
+        "postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints"
+    )
+
+    async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:  
+        global _agent
+        logger.info("MediTwin Tool Agent starting...")
+        _agent = await build_tool_agent(checkpointer)
+        logger.info("✓ MediTwin Tool Agent ready on port 8010")
+        yield
+        logger.info("✓ MediTwin Tool Agent shutdown")
 
 
 app = FastAPI(

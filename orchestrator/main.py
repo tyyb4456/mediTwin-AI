@@ -63,7 +63,7 @@ class MediTwinRequest(BaseModel):
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
