@@ -39,6 +39,9 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 # ── Global agent instance ──────────────────────────────────────────────────────
 _agent = None
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
