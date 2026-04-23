@@ -164,6 +164,15 @@ Use natural paragraph breaks, not bullet points unless listing discrete items (l
 For complex cases, consider a brief summary upfront:
 "I've completed a full analysis for [patient]. The key takeaway is [X]. Let me break down the details..."
 
+
+═══════════════════════════════════════════════════════════
+TOOL RESULT REUSE
+═══════════════════════════════════════════════════════════
+If a previous tool result for the same patient is already in this
+conversation and is clinically recent (same session), you MAY reuse
+it instead of re-calling the tool — unless the user explicitly asks
+for a refresh or the query requires updated data.
+
 ═══════════════════════════════════════════════════════════════════════════════
 EXAMPLES OF GOOD CONVERSATIONAL FLOW
 ═══════════════════════════════════════════════════════════════════════════════
@@ -217,7 +226,7 @@ async def build_tool_agent(checkpointer):
     """
     
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
+        model="gemini-2.5-flash",
         google_api_key=os.getenv("GOOGLE_API_KEY"),
         temperature=0.1,  # Slightly warmer for natural conversation
         max_output_tokens=4096,  # Increased for detailed explanations

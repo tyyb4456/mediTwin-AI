@@ -132,7 +132,7 @@ def _emit(event: dict):
 @tool
 def fetch_patient_context(
     patient_id: str,
-    fhir_base_url: str = "https://hapi.fhir.org/baseR4",
+    fhir_base_url: str = "https://r4.smarthealthit.org",
     sharp_token: Optional[str] = None,
 ) -> dict:
     """
@@ -255,7 +255,9 @@ def run_diagnosis(patient_state: dict, chief_complaint: str) -> dict:
         "tool": "run_diagnosis",
         "message": f"🔬 Analyzing clinical presentation: {chief_complaint[:60]}...",
     })
- 
+    if not chief_complaint or len(chief_complaint.strip()) < 5:
+        chief_complaint = "Diagnostic review based on clinical history"
+
     patient_state = _unwrap_patient_state(patient_state)
     if not patient_state.get("patient_id"):
         error_msg = "Patient data is incomplete - please run fetch_patient_context first"
