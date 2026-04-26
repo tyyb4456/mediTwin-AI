@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 import re
 
+# ----- patient State classes -----
 
 class Demographics(BaseModel):
     """Patient demographic information"""
@@ -64,6 +65,8 @@ class Encounter(BaseModel):
     date: str
     reason: Optional[str] = None
 
+
+# ----- Patient State -----
 
 class PatientState(BaseModel):
     """
