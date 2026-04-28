@@ -505,6 +505,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️  Digital Twin: Tools initialization issue ({e})")
 
+    await db.init()
+
     yield
     print("✓ Digital Twin Agent shutdown")
 
@@ -517,6 +519,9 @@ app = FastAPI(
 )
 
 app.include_router(stream_router)
+
+from history_router import router as history_router
+app.include_router(history_router, prefix="/history", tags=["history"])
 
 from fastapi.middleware.cors import CORSMiddleware
 

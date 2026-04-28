@@ -62,7 +62,7 @@ def is_available() -> bool:
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS digital_twin_simulations (
     id                          SERIAL PRIMARY KEY,
-    request_id                  VARCHAR(32) UNIQUE NOT NULL,
+    request_id                  VARCHAR(64) UNIQUE NOT NULL,
     patient_id                  TEXT NOT NULL,
     diagnosis                   TEXT NOT NULL,
     diagnosis_code              TEXT,
