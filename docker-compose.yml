@@ -32,7 +32,7 @@ services:
     networks:
       - meditwin-network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 60s
       timeout: 3s
       retries: 5
@@ -66,11 +66,11 @@ services:
       - postgres-checkpoint-data:/var/lib/postgresql/data
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD-SHELL", "pg_isready -U postgres"]
-    #   interval: 10s
-    #   timeout: 5s
-    #   retries: 5
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # ── One-time setup: Knowledge Base Ingest ──
@@ -115,20 +115,20 @@ services:
       - REDIS_PORT=6379
       - FHIR_BASE_URL=https://hapi.fhir.org/baseR4
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin   # ← ADD
-      - INTERNAL_TOKEN=meditwin-internal  
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin # ← ADD
+      - INTERNAL_TOKEN=meditwin-internal
     depends_on:
       redis:
         condition: service_healthy
-      postgres-checkpoint:           # ← ADD
-        condition: service_started
+      postgres-checkpoint:
+        condition: service_healthy
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
+      interval: 60s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # ── Agent 2: Diagnosis Agent (port 8002) ─────────────────────────────────────
@@ -144,15 +144,15 @@ services:
       - CHROMADB_HOST=chromadb
       - CHROMADB_PORT=8000
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin   # ← ADD
-      - INTERNAL_TOKEN=meditwin-internal                                                           # ← ADD (for /cache-clear and DELETE /history)
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin # ← ADD
+      - INTERNAL_TOKEN=meditwin-internal # ← ADD (for /cache-clear and DELETE /history)
     depends_on:
       chromadb:
         condition: service_started
       diagnosis-ingest:
         condition: service_completed_successfully
-      postgres-checkpoint:           # ← ADD
-        condition: service_started
+      postgres-checkpoint:
+        condition: service_healthy
     networks:
       - meditwin-network
     restart: unless-stopped
@@ -168,18 +168,18 @@ services:
       - "8003:8003"
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin   # ← ADD
-      - INTERNAL_TOKEN=meditwin-internal  
+      - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin # ← ADD
+      - INTERNAL_TOKEN=meditwin-internal
     depends_on:
-      postgres-checkpoint:           # ← ADD
-        condition: service_started
+      postgres-checkpoint:
+        condition: service_healthy
     networks:
       - meditwin-network
-    # healthcheck:
-      # test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
-      # interval: 60s
-      # timeout: 5s
-      # retries: 5
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8003/health" ]
+      interval: 60s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # ── Agent 4: Drug Safety MCP (port 8004) ──────────────────────────────────────
@@ -200,11 +200,11 @@ services:
         condition: service_healthy
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8004/health" ]
+      interval: 60s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # ── Agent 5: Imaging Triage Agent (port 8005) ─────────────────────────────────
@@ -218,11 +218,11 @@ services:
       - "8005:8005"
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8005/health" ]
+      interval: 60s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # ── Agent 6: Digital Twin Agent (port 8006) ───────────────────────────────────
@@ -241,11 +241,11 @@ services:
         condition: service_completed_successfully
     networks:
       - meditwin-network
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
-    #   interval: 60s
-    #   timeout: 5s
-    #   retries: 5
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8006/health" ]
+      interval: 60s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # ── Agent 7: Consensus + Escalation Agent (port 8007) ────────────────────────
@@ -306,15 +306,24 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints
     depends_on:
-      - patient-context
-      - diagnosis
-      - lab-analysis
-      - drug-safety
-      - imaging-triage
-      - digital-twin
-      - consensus
-      - explanation
-      - postgres-checkpoint
+      patient-context:
+        condition: service_healthy
+      diagnosis:
+        condition: service_started
+      lab-analysis:
+        condition: service_healthy
+      drug-safety:
+        condition: service_healthy
+      imaging-triage:
+        condition: service_healthy
+      digital-twin:
+        condition: service_healthy
+      consensus:
+        condition: service_started
+      explanation:
+        condition: service_started
+      postgres-checkpoint:
+        condition: service_healthy
     networks:
       - meditwin-network
     restart: unless-stopped
@@ -341,15 +350,24 @@ services:
       - POSTGRES_CHECKPOINT_URI=postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints
       - INTERNAL_TOKEN=meditwin-internal
     depends_on:
-      - patient-context
-      - diagnosis
-      - lab-analysis
-      - drug-safety
-      - imaging-triage
-      - digital-twin
-      - consensus
-      - explanation
-      - postgres-checkpoint
+      patient-context:
+        condition: service_healthy
+      diagnosis:
+        condition: service_started
+      lab-analysis:
+        condition: service_healthy
+      drug-safety:
+        condition: service_healthy
+      imaging-triage:
+        condition: service_healthy
+      digital-twin:
+        condition: service_healthy
+      consensus:
+        condition: service_started
+      explanation:
+        condition: service_started
+      postgres-checkpoint:
+        condition: service_healthy
     networks:
       - meditwin-network
     restart: unless-stopped

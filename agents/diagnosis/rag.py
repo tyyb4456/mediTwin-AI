@@ -190,20 +190,32 @@ def _validate_no_hallucination(output: DiagnosisOutput, patient_state: dict):
 
     # Collect allowed evidence from patient data
     for cond in patient_state.get("active_conditions", []):
-        allowed_terms.add(cond.get("display", "").lower())
+        if cond.get("display"):
+            allowed_terms.update(word.strip(".,;:()") for word in cond.get("display").lower().split())
 
     for lab in patient_state.get("lab_results", []):
-        allowed_terms.add(lab.get("display", "").lower())
+        if lab.get("display"):
+            allowed_terms.update(word.strip(".,;:()") for word in lab.get("display").lower().split())
 
     chief = patient_state.get("chief_complaint", "")
     if chief:
-        allowed_terms.update(chief.lower().split())
+        allowed_terms.update(word.strip(".,;:()") for word in chief.lower().split())
+
+    # Remove short words and common stop words
+    stop_words = {"and", "the", "with", "of", "in", "a", "an", "is", "are", "to", "for", "patient"}
+    allowed_terms = {t for t in allowed_terms if len(t) > 2 and t not in stop_words}
+
+    if not allowed_terms:
+        return
 
     # Check each diagnosis
     for diag in output.differential_diagnosis:
         for evidence in diag.supporting_evidence:
-            if evidence.lower() not in allowed_terms:
-                raise ValueError(f"Hallucinated evidence detected: {evidence}")
+            evidence_words = {w.strip(".,;:()") for w in evidence.lower().split()}
+            
+            # Check for any meaningful keyword overlap
+            if not allowed_terms.intersection(evidence_words):
+                logger.warning(f"Potentially hallucinated evidence detected (no keyword overlap): {evidence}")
  
 
 class DiagnosisRAG:

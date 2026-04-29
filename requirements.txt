@@ -48,13 +48,3 @@ python-dotenv
 
 mcp[cli]
 fastmcp
-
-# docker-compose build --no-cache diagnosis
-# docker-compose build --no-cache patient-context
-# docker-compose build --no-cache lab-analysis
-# docker-compose build --no-cache drug-safety
-# docker-compose build --no-cache consensus
-# docker-compose build --no-cache orchestrator
-# docker-compose build --no-cache explanation
-# docker-compose build --no-cache digital-twin
-# docker-compose build --no-cache imaging-triage
