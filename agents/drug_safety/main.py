@@ -557,6 +557,9 @@ combined_app = Starlette(
     lifespan=_lifespan,
 )
 
+# Alias for uvicorn (uvicorn main:app)
+app = combined_app
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(combined_app, host="127.0.0.1", port=8004)

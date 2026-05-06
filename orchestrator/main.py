@@ -63,23 +63,34 @@ class MediTwinRequest(BaseModel):
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver 
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db_uri = os.getenv(
-        "POSTGRES_CHECKPOINT_URI",
-        "postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints"
+    global _graph
+    # Prefer POSTGRES_CHECKPOINT_URI, then DATABASE_URL (Replit managed DB)
+    db_uri = (
+        os.getenv("POSTGRES_CHECKPOINT_URI")
+        or os.getenv("DATABASE_URL")
+        or "postgresql://postgres:postgres@localhost:5432/meditwin_checkpoints"
     )
 
-    async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
-        global _graph
-        logger.info("MediTwin Orchestrator starting...")
+    logger.info("MediTwin Orchestrator starting...")
+    try:
+        async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
+            _graph = await build_meditwin_graph_with_checkpointer(checkpointer)
+            logger.info("✓ LangGraph StateGraph compiled with PostgreSQL checkpointer + streaming")
+            logger.info("✓ MediTwin Orchestrator ready on port 5000")
+            yield
+    except Exception as e:
+        logger.warning(f"PostgreSQL checkpointer unavailable ({e}) — falling back to MemorySaver")
+        checkpointer = MemorySaver()
         _graph = await build_meditwin_graph_with_checkpointer(checkpointer)
-        logger.info("✓ LangGraph StateGraph compiled with PostgreSQL checkpointer + streaming")
-        logger.info("✓ MediTwin Orchestrator ready on port 8000")
+        logger.info("✓ LangGraph StateGraph compiled with MemorySaver (no persistence)")
+        logger.info("✓ MediTwin Orchestrator ready on port 5000")
         yield
-        logger.info("✓ MediTwin Orchestrator shutdown")
+    logger.info("✓ MediTwin Orchestrator shutdown")
 
 
 app = FastAPI(

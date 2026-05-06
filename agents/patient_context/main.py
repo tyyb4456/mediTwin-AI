@@ -171,7 +171,7 @@ app.add_middleware(
 app.include_router(stream_router)
 app.include_router(history_router, prefix="/history", tags=["history"])
 
-from agents.patient_context.utils import (
+from utils import (
     fetch_fhir_resource,
     normalize_patient,
     normalize_conditions,

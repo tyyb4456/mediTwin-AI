@@ -2,24 +2,27 @@
 Agent 10: MediTwin Tool Agent
 Port: 8010
 
-A conservative LangGraph ReAct agent. The LLM decides whether to call tools:
+A LangGraph ReAct agent. The LLM decides whether to call tools:
   - Query with patient ID  → fetches context, calls only relevant tools
   - Query without patient ID → answers from general medical knowledge, no tools
 
 Endpoints:
-  POST /query  — Natural language clinical query (the only entry point)
-  GET  /health — Health + tool registry status
+  POST /query        — Natural language clinical query (JSON response)
+  POST /query/stream — SSE streaming version
+  GET  /health       — Health + tool registry status
   GET  /.well-known/agent-card — A2A metadata
 """
 import os
 import sys
 import time
+import uuid
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from pydantic import BaseModel
@@ -34,42 +37,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger("meditwin.tool_agent")
 
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver 
-
-# ── Global agent instance ──────────────────────────────────────────────────────
-_agent = None
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from dotenv import load_dotenv
 load_dotenv()
 
 
+# ── Global agent instance ──────────────────────────────────────────────────────
+_agent = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db_uri = os.getenv(
-        "POSTGRES_CHECKPOINT_URI",
-        "postgresql://postgres:postgres@postgres-checkpoint:5432/meditwin_checkpoints"
+    global _agent
+    db_uri = (
+        os.getenv("POSTGRES_CHECKPOINT_URI")
+        or os.getenv("DATABASE_URL")
+        or "postgresql://postgres:postgres@localhost:5432/meditwin_checkpoints"
     )
 
-    async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:  
-        global _agent
-        logger.info("MediTwin Tool Agent starting...")
-        _agent = await build_tool_agent(checkpointer)
-        logger.info("✓ MediTwin Tool Agent ready on port 8010")
+    if not os.getenv("GOOGLE_API_KEY"):
+        logger.warning(
+            "GOOGLE_API_KEY not set — Tool Agent starting in degraded mode. "
+            "Set GOOGLE_API_KEY to enable the conversational agent."
+        )
         yield
-        logger.info("✓ MediTwin Tool Agent shutdown")
+        return
+
+    from langgraph.checkpoint.memory import MemorySaver
+    logger.info("MediTwin Tool Agent starting...")
+    try:
+        async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
+            _agent = await build_tool_agent(checkpointer)
+            logger.info("✓ MediTwin Tool Agent ready on port 8010")
+            yield
+    except Exception as e:
+        logger.warning(f"PostgreSQL unavailable ({e}) — falling back to MemorySaver")
+        try:
+            checkpointer = MemorySaver()
+            _agent = await build_tool_agent(checkpointer)
+            logger.info("✓ MediTwin Tool Agent ready (MemorySaver) on port 8010")
+        except Exception as e2:
+            logger.error(f"Tool Agent failed to start: {e2}")
+        yield
+    logger.info("✓ MediTwin Tool Agent shutdown")
 
 
 app = FastAPI(
     title="MediTwin Tool Agent",
     description=(
-        "Conservative ReAct agent. Answers general medical questions directly. "
+        "ReAct agent. Answers general medical questions directly. "
         "Calls specialist agent tools only when a patient ID is present and relevant."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
-
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,13 +120,13 @@ class QueryRequest(BaseModel):
     Without patient ID (answered from knowledge, no tools):
       "What is the mechanism of action of azithromycin?"
       "What are the diagnostic criteria for community-acquired pneumonia?"
-      "What is the difference between WBC and CRP as infection markers?"
     """
     session_id: Optional[str] = None
     """
     Optional session ID for thread-scoped memory.
-    If omitted, defaults to 'default'. Use patient ID here for continuity
-    across multiple queries about the same patient.
+    If omitted, a unique session ID is auto-generated per request.
+    Pass the same session_id across multiple related queries about the same patient
+    to maintain conversation context.
     """
 
 
@@ -134,7 +156,6 @@ def _extract_tools_called(messages: list) -> list[str]:
 def _extract_tool_outputs(messages: list) -> dict:
     """Return last output per tool as parsed dict (for structured consumers)."""
     import json
-    # Build a map from tool_call_id → tool name via AIMessage.tool_calls
     id_to_name: dict = {}
     for msg in messages:
         if isinstance(msg, AIMessage):
@@ -168,13 +189,18 @@ async def query(request: QueryRequest) -> JSONResponse:
       - If no patient ID → answers directly from medical knowledge, no tools
 
     The session_id field enables conversation continuity (memory).
-    Pass the same session_id across multiple related queries.
+    Pass the same session_id across multiple related queries. If omitted,
+    a fresh unique session is created automatically.
     """
     if not request.query or not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
 
-    session_id = request.session_id or "default"
-    config = {"configurable": {"thread_id": session_id}}
+    # Auto-generate a unique session if not provided — prevents cross-user contamination
+    session_id = request.session_id or str(uuid.uuid4())
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": 20,
+    }
 
     start_time = time.time()
     logger.info(f"Query received — session={session_id} | query={request.query[:100]}")
@@ -198,13 +224,13 @@ async def query(request: QueryRequest) -> JSONResponse:
     logger.info(f"Query complete — {elapsed}s | mode={mode} | tools={tools_called}")
 
     return JSONResponse(content={
-        "answer":         answer,
-        "mode":           mode,
-        "tools_called":   tools_called,
-        "tool_outputs":   tool_outputs,
+        "answer":          answer,
+        "mode":            mode,
+        "tools_called":    tools_called,
+        "tool_outputs":    tool_outputs,
         "elapsed_seconds": elapsed,
-        "session_id":     session_id,
-        "timestamp":      datetime.now(timezone.utc).isoformat(),
+        "session_id":      session_id,
+        "timestamp":       datetime.now(timezone.utc).isoformat(),
     })
 
 
@@ -213,14 +239,27 @@ async def query(request: QueryRequest) -> JSONResponse:
 @app.get("/health")
 async def health() -> JSONResponse:
     from tools import MEDITWIN_TOOLS
-    return JSONResponse(content={
-        "status":          "healthy" if _agent else "initializing",
-        "mode":            "conservative_react",
+    has_key = bool(os.getenv("GOOGLE_API_KEY"))
+    if not has_key:
+        status = "degraded"
+        note = "GOOGLE_API_KEY not set — conversational agent disabled"
+    elif _agent:
+        status = "healthy"
+        note = None
+    else:
+        status = "initializing"
+        note = None
+    body = {
+        "status":          status,
+        "mode":            "react_tool_calling",
         "tools_available": [t.name for t in MEDITWIN_TOOLS],
         "tool_count":      len(MEDITWIN_TOOLS),
-        "memory_enabled":  True,
-        "version":         "1.0.0",
-    })
+        "memory_enabled":  has_key,
+        "version":         "2.0.0",
+    }
+    if note:
+        body["note"] = note
+    return JSONResponse(content=body)
 
 
 # ── A2A Agent Card ─────────────────────────────────────────────────────────────
@@ -228,37 +267,34 @@ async def health() -> JSONResponse:
 @app.get("/.well-known/agent-card")
 async def agent_card() -> JSONResponse:
     from tools import MEDITWIN_TOOLS
-    tools = MEDITWIN_TOOLS
     return JSONResponse(content={
         "name":    "MediTwin Tool Agent",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "port":    8010,
-        "type":    "Conservative ReAct Tool-Calling Agent",
+        "type":    "ReAct Tool-Calling Agent",
         "description": (
-            "A LangGraph ReAct agent where all 8 MediTwin specialist agents are @tools. "
+            "A LangGraph ReAct agent where all 8 MediTwin specialist agents are async @tools. "
             "The LLM triages every query: if a patient ID is present it fetches patient "
             "context then selectively calls only the relevant specialist tools; "
-            "if no patient ID is present it answers from general medical knowledge with no tool calls."
+            "if no patient ID is present it answers from general medical knowledge."
         ),
         "triage_logic": {
             "with_patient_id":    "fetch_patient_context → selective tools based on query intent",
             "without_patient_id": "direct LLM answer from medical knowledge, zero tool calls",
         },
-        "vs_orchestrator": {
-            "orchestrator_8000": "Deterministic graph — always runs all 8 agents in fixed order",
-            "tool_agent_8010":   "LLM-driven triage — minimal tools, zero tools for general questions",
-        },
-        "tools": [{"name": t.name, "description": t.description.split("WHEN TO USE:")[0].strip()} for t in tools],
+        "tools": [{"name": t.name, "description": t.description[:120]} for t in MEDITWIN_TOOLS],
         "capabilities": [
             "natural_language_query",
             "automatic_patient_id_detection",
             "selective_tool_invocation",
             "general_medical_knowledge",
             "thread_scoped_memory",
-            "conservative_tool_calling",
+            "sse_streaming",
+            "server_side_patient_state_caching",
         ],
-        "endpoint": {
-            "query": "POST /query — single natural language entry point",
+        "endpoints": {
+            "query":        "POST /query — JSON response",
+            "query_stream": "POST /query/stream — SSE streaming",
         },
     })
 

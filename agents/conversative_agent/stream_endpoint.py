@@ -1,36 +1,29 @@
 """
-agents/tool_agent/stream_endpoint_v2.py
---------------------------------------
+agents/tool_agent/stream_endpoint.py
+-------------------------------------
 SSE streaming endpoint for the MediTwin Tool Agent.
 
 Streams two categories of events to the frontend in real-time:
 
   1. TOOL EVENTS (stream_mode="custom")
-     Emitted by each @tool via get_stream_writer() in tools.py:
+     Emitted by each async @tool via get_stream_writer() in tools.py.
+     Works correctly because tools are async — same event loop, same context:
        {"type": "tool_start",    "tool": str, "message": str}
        {"type": "tool_progress", "tool": str, "message": str}
        {"type": "tool_complete", "tool": str, "message": str, "data": dict}
        {"type": "tool_error",    "tool": str, "message": str}
 
   2. LLM TOKENS (stream_mode="messages")
-     Token-by-token output from the Gemini reasoning / final answer.
-     Routed by node name — only the final answer node tokens are sent:
+     Token-by-token output from the Gemini reasoning / final answer:
        {"type": "llm_token", "token": str}
 
   3. LIFECYCLE EVENTS
        {"type": "status",   "message": str}
-       {"type": "complete", "elapsed_ms": int}
+       {"type": "complete", "elapsed_ms": int, "answer": str, ...}
        {"type": "error",    "message": str, "fatal": bool}
 
-ADD to agents/tool_agent/main.py:
-
-    from stream_endpoint import router as stream_router
-    app.include_router(stream_router)
-
 Usage (frontend):
-    const es = new EventSource('/query/stream');  // GET with ?query=...&session_id=...
-    // OR POST to /query/stream with JSON body
-
+    const es = new EventSource('/query/stream');
     es.onmessage = (e) => {
         if (e.data === '[DONE]') { es.close(); return; }
         const event = JSON.parse(e.data);
@@ -43,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from typing import Optional, AsyncIterator
 
 from fastapi import APIRouter
@@ -76,7 +70,7 @@ class StreamQueryRequest(BaseModel):
     session_id: Optional[str] = None
 
 
-# ── Message helpers (mirrors /query endpoint) ──────────────────────────────────
+# ── Message helpers ────────────────────────────────────────────────────────────
 
 def _tools_called(messages: list) -> list[str]:
     seen = []
@@ -125,24 +119,23 @@ async def _stream_query(
     agent,
 ) -> AsyncIterator[str]:
     """
-    Core SSE generator using astream_events(v='v2').
+    Core SSE generator using astream_events(version='v2').
 
-    Works with both LangChain AgentExecutor (langchain.agents.create_agent)
-    and compiled LangGraph graphs — unlike astream(stream_mode=[...]) which
-    is LangGraph-only.
-
-    Events:
-      on_custom_event   → custom tool_start/progress/complete from get_stream_writer()
-      on_tool_start     → native tool_start (fallback)
-      on_tool_end       → native tool_complete (fallback)
-      on_chat_model_stream → llm_token (handles str and Gemini list-of-parts)
-      on_chain_end      → captures final state for the rich complete event
+    Event routing:
+      on_custom_event      → tool_start/progress/complete from get_stream_writer() in async tools
+      on_tool_start        → native tool_start (fallback for tools without custom events)
+      on_tool_end          → native tool_complete (fallback)
+      on_chat_model_stream → llm_token (handles str and Gemini list-of-parts format)
+      on_chain_end         → captures final messages for the complete event
     """
     t0 = time.perf_counter()
 
     yield _sse({"type": "status", "message": "Processing your query..."})
 
-    config = {"configurable": {"thread_id": session_id}}
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": 20,
+    }
     final_messages: list = []
 
     try:
@@ -158,19 +151,19 @@ async def _stream_query(
             # ── Custom tool writer events (get_stream_writer pattern) ──────────
             if kind == "on_custom_event":
                 yield _sse({
-                    "type": data.get("type", "status"),
-                    "tool": data.get("tool"),
+                    "type":    data.get("type", "status"),
+                    "tool":    data.get("tool"),
                     "message": data.get("message", ""),
-                    "data": data.get("data"),
+                    "data":    data.get("data"),
                 })
 
-            # ── Native tool lifecycle events ───────────────────────────────────
+            # ── Native tool lifecycle events (fallback) ────────────────────────
             elif kind == "on_tool_start":
                 yield _sse({
-                    "type": "tool_start",
-                    "tool": name,
+                    "type":    "tool_start",
+                    "tool":    name,
                     "message": f"Calling {name}...",
-                    "input": data.get("input", {}),
+                    "input":   data.get("input", {}),
                 })
 
             elif kind == "on_tool_end":
@@ -180,10 +173,10 @@ async def _stream_query(
                 except Exception:
                     parsed = raw_output
                 yield _sse({
-                    "type": "tool_complete",
-                    "tool": name,
+                    "type":    "tool_complete",
+                    "tool":    name,
                     "message": f"{name} completed",
-                    "data": parsed,
+                    "data":    parsed,
                 })
 
             # ── LLM token streaming ────────────────────────────────────────────
@@ -194,7 +187,7 @@ async def _stream_query(
                 content = getattr(chunk, "content", None)
                 if not content:
                     continue
-                # Handle str and Gemini list-of-parts format
+                # Handle plain string and Gemini list-of-parts format
                 if isinstance(content, str):
                     yield _sse({"type": "llm_token", "token": content})
                 elif isinstance(content, list):
@@ -206,8 +199,10 @@ async def _stream_query(
                         elif isinstance(part, str) and part:
                             yield _sse({"type": "llm_token", "token": part})
 
-            # ── Capture final agent output messages ────────────────────────────
-            elif kind == "on_chain_end" and name in ("AgentExecutor", "LangGraph", "agent"):
+            # ── Capture final agent output ─────────────────────────────────────
+            # create_agent compiles to a LangGraph graph; the top-level chain
+            # name varies. We capture messages from any chain_end that has them.
+            elif kind == "on_chain_end":
                 output = data.get("output", {})
                 if isinstance(output, dict):
                     msgs = output.get("messages", [])
@@ -219,7 +214,7 @@ async def _stream_query(
         yield _sse({"type": "error", "message": str(exc), "fatal": True})
         return
 
-    # ── Rich complete event — mirrors the /query JSON response shape ───────────
+    # ── Rich complete event ────────────────────────────────────────────────────
     called = _tools_called(final_messages)
     outputs = _tool_outputs(final_messages) if called else {}
     answer = _final_answer(final_messages)
@@ -227,13 +222,13 @@ async def _stream_query(
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     yield _sse({
-        "type": "complete",
-        "elapsed_ms": elapsed_ms,
-        "answer": answer,
-        "mode": mode,
+        "type":        "complete",
+        "elapsed_ms":  elapsed_ms,
+        "answer":      answer,
+        "mode":        mode,
         "tools_called": called,
         "tool_outputs": outputs,
-        "session_id": session_id,
+        "session_id":  session_id,
     })
 
 
@@ -243,8 +238,14 @@ async def _stream_query(
 async def stream_query(request: StreamQueryRequest):
     """
     SSE streaming version of POST /query.
+
+    Returns a stream of server-sent events. Each event is a JSON object.
+    The stream ends with 'data: [DONE]'.
+
+    If session_id is omitted, a unique session is auto-generated.
+    To maintain context across multiple streaming queries, pass the same session_id.
     """
-    from main import _agent  # import singleton from main.py at call time
+    from main import _agent
 
     if not _agent:
         async def error_gen():
@@ -258,7 +259,8 @@ async def stream_query(request: StreamQueryRequest):
             yield _sse_done()
         return StreamingResponse(bad_req(), media_type="text/event-stream", headers=SSE_HEADERS)
 
-    session_id = request.session_id or "default"
+    # Auto-generate unique session — prevents cross-user memory contamination
+    session_id = request.session_id or str(uuid.uuid4())
 
     async def generator():
         async for chunk in _stream_query(request.query, session_id, _agent):
