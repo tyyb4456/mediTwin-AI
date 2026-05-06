@@ -17,7 +17,9 @@ langchain-community
 langchain-google-genai
 langgraph
 langgraph-checkpoint-postgres
+langchain-core
 langsmith
+langchain-chroma
 
 # PostgreSQL for LangGraph checkpointer (short-term memory)
 psycopg[binary,pool]
@@ -34,7 +36,6 @@ scikit-learn
 xgboost
 
 # Medical imaging
-# tensorflow
 Pillow
 
 # FHIR client
@@ -48,3 +49,9 @@ python-dotenv
 
 mcp[cli]
 fastmcp
+
+asyncpg
+
+starlette
+
+tensorflow-cpu

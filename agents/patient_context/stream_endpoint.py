@@ -45,7 +45,7 @@ router = APIRouter()
 # Import helpers from the main module (works because main.py adds itself to path)
 # These are the same functions used by /fetch — no duplication.
 
-from agents.patient_context.utils import (
+from patient_context.utils import (
     fetch_fhir_resource,
     normalize_patient,
     normalize_conditions,
