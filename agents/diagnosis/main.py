@@ -96,9 +96,9 @@ async def lifespan(app: FastAPI):
         logger.warning(f"ChromaDB unavailable ({e}) — starting in LLM-only fallback mode")
         try:
             diagnosis.initialize_fallback()
-            logger.info("✓ Diagnosis Agent started — FALLBACK mode (LLM-only)")
+            logger.info("    ✔   Diagnosis Agent started — FALLBACK mode (LLM-only)")
         except Exception as e2:
-            logger.error(f"FATAL: Could not initialize even in fallback mode: {e2}")
+            logger.error(f"    ✘   FATAL: Could not initialize even in fallback mode: {e2}")
             # Don't sys.exit — let FastAPI start anyway so /health returns degraded status
 
     await db_init()          # ← ADD THIS
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     yield
  
     await db_close()         # ← ADD THIS
-    logger.info("✓ Diagnosis Agent shutdown")
+    logger.info("    ✔   Diagnosis Agent shutdown")
 
 
 app = FastAPI(
@@ -242,7 +242,7 @@ async def cache_clear(
     from rag import _cache
     cleared = len(_cache._store)
     _cache._store.clear()
-    logger.info(f"Cache cleared: {cleared} entries removed")
+    logger.info(f"    ✔   Cache cleared: {cleared} entries removed")
     return {"cleared_entries": cleared, "status": "ok"}
 
 

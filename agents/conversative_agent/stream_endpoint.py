@@ -210,7 +210,7 @@ async def _stream_query(
                         final_messages = msgs
 
     except Exception as exc:
-        logger.error(f"Stream error: {exc}", exc_info=True)
+        logger.error(f"    ✘    Stream error: {exc}", exc_info=True)
         yield _sse({"type": "error", "message": str(exc), "fatal": True})
         return
 

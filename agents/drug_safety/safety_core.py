@@ -763,7 +763,7 @@ async def enrich_interactions_with_llm(
         return result
 
     except Exception as e:
-        print(f"  ⚠️  Interaction enrichment LLM failed: {e}")
+        print(f"    Interaction enrichment LLM failed: {e}")
         return None
 
 
@@ -870,7 +870,7 @@ async def generate_patient_risk_profile(
         return result
 
     except Exception as e:
-        print(f"  ⚠️  Risk profile LLM failed: {e}")
+        print(f"    Risk profile LLM failed: {e}")
         return None
 
 

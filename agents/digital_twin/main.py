@@ -12,13 +12,17 @@ P1 FIXES APPLIED:
   #2 - Drug combination synergy effects explained in scenarios
 """
 
+
+import logging
+logger = logging.getLogger("digital_twin_agent")
+
 try:
     import db
     from db import save_simulation, SimulationRecord
     _db_available = True
 except ImportError:
     _db_available = False
-    print("⚠️  Database module not available - persistence disabled")
+    logger.error("   ✘   Database module not available - persistence disabled")
 
 from temporal_effects import (
     predict_temporal_trajectory,
@@ -156,7 +160,7 @@ async def _save_simulation_to_db(
         return (row_id is not None), row_id
     
     except Exception as e:
-        print(f"⚠️  Database save failed (non-fatal): {e}")
+        logger.error(f"  ✘   Database save failed (non-fatal): {e}")
         return False, None
  
 
@@ -455,7 +459,7 @@ async def lifespan(app: FastAPI):
             "No model files found. "
             "Run: python agents/digital_twin/train_models.py"
         )
-        print(f"⚠️  Digital Twin: {_models_error}")
+        logger.error(f"  ✘   Digital Twin: {_models_error}")
     else:
         try:
             for name, path in available_models.items():
@@ -469,16 +473,16 @@ async def lifespan(app: FastAPI):
                         _model_metadata[name] = json.load(f)
 
             _models_loaded = True
-            print(f"✓ Digital Twin: loaded {len(_models)} XGBoost risk models")
+            logger.info(f"   ✔   Digital Twin: loaded {len(_models)} XGBoost risk models")
             
             # P0 FIX #1: Explicit notification if extended models are missing
             if "readmission_90d" in missing or "mortality_1yr" in missing:
-                print(f"  ⚠️  Extended horizon models not found: {missing}")
-                print(f"     Run train_models.py to enable 90d/1yr predictions")
+                logger.warning(f"  ⚠   Extended horizon models not found: {missing}")
+                logger.info(f"     Run train_models.py to enable 90d/1yr predictions")
 
         except Exception as e:
             _models_error = f"Model load failed: {e}"
-            print(f"❌ Digital Twin: {_models_error}")
+            logger.error(f"  ✘   Digital Twin: {_models_error}")
 
     api_key = os.getenv("GOOGLE_API_KEY")
     if api_key:
@@ -489,11 +493,11 @@ async def lifespan(app: FastAPI):
                 max_output_tokens=2048,
             )
             _llm_ready = True
-            print("✓ Digital Twin: LLM narrative ready (Gemini 2.5 Flash lite)")
+            logger.info("   ✔   Digital Twin: LLM narrative ready (Gemini 2.5 Flash lite)")
         except Exception as e:
-            print(f"⚠️  Digital Twin: LLM init failed ({e}) — narrative disabled")
+            logger.error(f"  ✘   Digital Twin: LLM init failed ({e}) — narrative disabled")
     else:
-        print("⚠️  Digital Twin: No GOOGLE_API_KEY — narrative disabled")
+        logger.warning("  ⚠   Digital Twin: No GOOGLE_API_KEY — narrative disabled")
 
     try:
         check_drug_guideline_adherence.invoke({
@@ -501,14 +505,14 @@ async def lifespan(app: FastAPI):
             "proposed_drug": "Amoxicillin",
         })
         _tools_ready = True
-        print("✓ Digital Twin: Clinical decision support tools ready")
+        logger.info("   ✔   Digital Twin: Clinical decision support tools ready")
     except Exception as e:
-        print(f"⚠️  Digital Twin: Tools initialization issue ({e})")
+        logger.error(f"  ✘   Digital Twin: Tools initialization issue ({e})")
 
     await db.init()
 
     yield
-    print("✓ Digital Twin Agent shutdown")
+    logger.info("   ✔   Digital Twin Agent shutdown")
 
 
 app = FastAPI(
@@ -726,7 +730,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
                 feature_vector, feature_dict, _models, FEATURE_NAMES
             )
         except Exception as e:
-            print(f"  ⚠️  Sensitivity analysis failed: {e}")
+            logger.warning(f"  ⚠  Sensitivity analysis failed: {e}")
 
     # 4. Prepare treatment options
     treatment_options = list(request.treatment_options)
@@ -782,7 +786,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
                 adherence_results.sort(key=lambda r: priority.get(r.get("adherence", "UNKNOWN"), 1))
                 guideline_adherence = adherence_results
             except Exception as e:
-                print(f"  ⚠️  Guideline check failed: {e}")
+                logger.warning(f"  ⚠  Guideline check failed: {e}")
 
         # Safety check
         safety_check = None
@@ -796,7 +800,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
                     "current_medications":   current_meds,
                 })
             except Exception as e:
-                print(f"  ⚠️  Safety check failed: {e}")
+                logger.warning(f"  ⚠  Safety check failed: {e}")
         
         # P0 FIX #2: Pharmacokinetic dose adjustments
         pk_adjustments = calculate_pk_adjustments(opt.drugs, patient_state, feature_dict)
@@ -811,10 +815,10 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
 
         if safety_check:
             for alert in safety_check.get("allergy_alerts", []):
-                key_risks.append(f"🚨 {alert['alert']}")
+                key_risks.append(f" ☢ {alert['alert']}")
             for interaction in safety_check.get("interaction_alerts", []):
                 key_risks.append(
-                    f"⚠️  DDI: {interaction['warning']} "
+                    f" ⚠  DDI: {interaction['warning']} "
                     f"({interaction['proposed_drug']} ↔ {interaction['existing_drug']})"
                 )
 
@@ -831,7 +835,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             for g in (guideline_adherence if isinstance(guideline_adherence, list) else [guideline_adherence]):
                 if g.get("adherence") == "OFF_GUIDELINE":
                     key_risks.append(
-                        f"⚠️  Off-guideline: {g.get('drug', '')} — {g.get('message', '')}"
+                        f"  ⚠   Off-guideline: {g.get('drug', '')} — {g.get('message', '')}"
                     )
 
         if not key_risks:
@@ -886,7 +890,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
     ]
     if not safe_scoreable:
         safe_scoreable = scoreable
-        print("  ⚠️  All treatment options flagged CONTRAINDICATED")
+        logger.warning("  ⚠   All treatment options flagged CONTRAINDICATED")
 
     if avoid_hospitalization:
         non_hosp = [
@@ -911,7 +915,7 @@ async def simulate(request: DigitalTwinRequest) -> DigitalTwinResponse:
             patient_age = patient_state.get("demographics", {}).get("age", 65)
             cost_effectiveness = analyze_cost_effectiveness(scenarios, patient_age)
         except Exception as e:
-            print(f"  ⚠️  Cost-effectiveness analysis failed: {e}")
+            logger.warning(f"  ⚠   Cost-effectiveness analysis failed: {e}")
 
     # 8. Feature attribution
     try:

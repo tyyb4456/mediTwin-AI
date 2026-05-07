@@ -139,7 +139,7 @@ class _SimpleCache:
         if key in self._store:
             ts, value = self._store[key]
             if time.time() - ts < self._ttl:
-                logger.debug(f"Cache HIT for patient={patient_id}")
+                logger.debug(f"    ℹ   Cache HIT for patient={patient_id}")
                 return value
             del self._store[key]
         return None
@@ -215,7 +215,7 @@ def _validate_no_hallucination(output: DiagnosisOutput, patient_state: dict):
             
             # Check for any meaningful keyword overlap
             if not allowed_terms.intersection(evidence_words):
-                logger.warning(f"Potentially hallucinated evidence detected (no keyword overlap): {evidence}")
+                logger.warning(f"    ⚠   Potentially hallucinated evidence detected (no keyword overlap): {evidence}")
  
 
 class DiagnosisRAG:
@@ -246,7 +246,7 @@ class DiagnosisRAG:
         if count == 0:
             raise RuntimeError(f"Collection '{COLLECTION_NAME}' is empty. Run ingest.py first.")
 
-        print(f"✓ ChromaDB connected — {count} chunks in '{COLLECTION_NAME}'")
+        logger.info(f"    ✔   ChromaDB connected — {count} chunks in '{COLLECTION_NAME}'")
 
         # ── key change: use with_structured_output instead of JsonOutputParser ──
         llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0.2)
@@ -267,11 +267,11 @@ class DiagnosisRAG:
 
         self._retrieve_tool = retrieve_clinical_context
 
-        logger.info(f"ChromaDB connected — {count} chunks in '{COLLECTION_NAME}'")
+        logger.info(f"    ✔   ChromaDB connected — {count} chunks in '{COLLECTION_NAME}'")
         self._rag_available = True
         self._init_llms()
         self._initialized = True
-        logger.info("Diagnosis RAG chain initialized (RAG mode)")
+        logger.info("    ✔   Diagnosis RAG chain initialized (RAG mode)")
     
     def initialize_fallback(self):
         """
@@ -281,7 +281,7 @@ class DiagnosisRAG:
         self._rag_available = False
         self._init_llms()
         self._initialized = True
-        logger.warning("Diagnosis RAG chain initialized in FALLBACK mode (LLM-only, no RAG context)")
+        logger.warning("    ⚠   Diagnosis RAG chain initialized in FALLBACK mode (LLM-only, no RAG context)")
  
     def _init_llms(self):
         llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0.1)
@@ -449,7 +449,7 @@ class DiagnosisRAG:
                 output.recommended_next_steps.insert(0, NextStep(
                     category="MEDICATION",
                     description=(
-                        f"⚠️ Allergy alert: {', '.join(removed)} removed. "
+                        f"    ⚠   Allergy alert: {', '.join(removed)} removed. "
                         f"Use alternative such as azithromycin or levofloxacin."
                     ),
                     urgency="stat",

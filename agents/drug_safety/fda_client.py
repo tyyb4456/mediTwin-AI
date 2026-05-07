@@ -17,6 +17,9 @@ OPENFDA_BASE = "https://api.fda.gov/drug"
 
 TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 
+import logging
+logger = logging.getLogger("fda_client")
+
 
 # ── RxNorm: drug name → RxCUI code ───────────────────────────────────────────
 
@@ -37,7 +40,7 @@ async def get_rxcui(drug_name: str, client: httpx.AsyncClient) -> Optional[str]:
         )
         return rxcui
     except Exception as e:
-        print(f"  RxCUI lookup failed for '{drug_name}': {e}")
+        logger.error(f" ✘  RxCUI lookup failed for '{drug_name}': {e}")
         return None
 
 
@@ -193,7 +196,7 @@ async def _get_fda_warnings_single(
         return warnings
 
     except Exception as e:
-        print(f"  FDA warning lookup failed for '{drug_name}': {e}")
+        logger.error(f"  ✘   FDA warning lookup failed for '{drug_name}': {e}")
         return []
 
 

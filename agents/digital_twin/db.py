@@ -40,9 +40,9 @@ async def init() -> None:
     try:
         _pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
         await _ensure_table()
-        logger.info("✓ PostgreSQL pool ready (digital_twin)")
+        logger.info("   ✔   PostgreSQL pool ready (digital_twin)")
     except Exception as e:
-        logger.warning(f"PostgreSQL unavailable ({e}) — simulation results will NOT be persisted")
+        logger.warning(f"  ⚠  PostgreSQL unavailable ({e}) — simulation results will NOT be persisted")
         _pool = None
 
 

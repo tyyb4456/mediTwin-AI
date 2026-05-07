@@ -323,5 +323,5 @@ async def delete_patient_history(
         )
 
     deleted = int(result.split()[-1])
-    logger.info(f"Deleted {deleted} records for patient={patient_id}")
+    logger.info(f"    ✔   Deleted {deleted} records for patient={patient_id}")
     return {"patient_id": patient_id, "deleted_records": deleted, "status": "ok"}

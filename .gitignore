@@ -1,8 +1,4 @@
 .env
 __pycache__
-outputs.txt
-todo.txt
-test.ipynb
-streamm.ipynb
-test-doc.txt
-agent_output
+*.pyc
+*.pyo

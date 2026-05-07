@@ -48,9 +48,9 @@ async def init() -> None:
     )
     try:
         _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
-        logger.info("✓ DB reader pool ready (tool_agent)")
+        logger.info("   ✔   DB reader pool ready (tool_agent)")
     except Exception as e:
-        logger.warning(f"DB reader unavailable ({e}) — tools will report no cached data")
+        logger.warning(f"   ⚠   DB reader unavailable ({e}) — tools will report no cached data")
         _pool = None
 
 
@@ -119,7 +119,7 @@ async def get_latest_patient_context(patient_id: str) -> Optional[dict]:
             "_fetched_at":         str(row.get("created_at", "")),
         }
     except Exception as e:
-        logger.error(f"[patient_context] DB query failed: {e}")
+        logger.error(f"  ✘    [patient_context] DB query failed: {e}")
         return None
 
 # ── Diagnosis ──────────────────────────────────────────────────────────────────
@@ -165,7 +165,7 @@ async def get_latest_diagnosis(patient_id: str) -> Optional[dict]:
             "_fetched_at":             str(row.get("created_at", "")),
         }
     except Exception as e:
-        logger.error(f"[diagnosis] DB query failed: {e}")
+        logger.error(f"  ✘    [diagnosis] DB query failed: {e}")
         return None
 
 # ── Lab Analysis ───────────────────────────────────────────────────────────────
@@ -217,7 +217,7 @@ async def get_latest_lab_analysis(patient_id: str) -> Optional[dict]:
             "_fetched_at": str(row.get("created_at", "")),
         }
     except Exception as e:
-        logger.error(f"[lab_analysis] DB query failed: {e}")
+        logger.error(f"  ✘    [lab_analysis] DB query failed: {e}")
         return None
 
 # ── Drug Safety ────────────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ async def get_latest_drug_safety(patient_id: str) -> Optional[dict]:
             "_fetched_at": str(row.get("created_at", "")),
         }
     except Exception as e:
-        logger.error(f"[drug_safety] DB query failed: {e}")
+        logger.error(f"  ✘    [drug_safety] DB query failed: {e}")
         return None
 
 # ── Imaging Triage ─────────────────────────────────────────────────────────────
@@ -323,7 +323,7 @@ async def get_latest_imaging(patient_id: str) -> Optional[dict]:
             "_fetched_at": str(row.get("created_at", "")),
         }
     except Exception as e:
-        logger.error(f"[imaging_triage] DB query failed: {e}")
+        logger.error(f"  ✘    [imaging_triage] DB query failed: {e}")
         return None
 
 
@@ -379,5 +379,5 @@ async def get_latest_simulation(patient_id: str) -> Optional[dict]:
             "_fetched_at": str(row.get("created_at", "")),
         }
     except Exception as e:
-        logger.error(f"[digital_twin] DB query failed: {e}")
+        logger.error(f"  ✘    [digital_twin] DB query failed: {e}")
         return None

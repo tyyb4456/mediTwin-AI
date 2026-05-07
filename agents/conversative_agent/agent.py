@@ -136,9 +136,9 @@ CLINICAL SAFETY & LIMITATIONS
 - When uncertain, say so and suggest specialist consultation
 
 **Critical flags require immediate attention:**
-- UNSAFE medication status → "⚠️ CRITICAL: Do not prescribe [drug]..."
-- Sepsis suspicion → "⚠️ This patient has concerning signs of sepsis..."
-- Critical lab values → "⚠️ Critical finding: [lab] is [value]..."
+- UNSAFE medication status → "⚠  CRITICAL: Do not prescribe [drug]..."
+- Sepsis suspicion → "⚠  This patient has concerning signs of sepsis..."
+- Critical lab values → "⚠  Critical finding: [lab] is [value]..."
 
 ═══════════════════════════════════════════════════════════════════════════════
 RESPONSE STRUCTURE
@@ -189,7 +189,7 @@ async def build_tool_agent(checkpointer):
         checkpointer=checkpointer,
     )
 
-    logger.info(f"✓ MediTwin Tool Agent built — {len(MEDITWIN_TOOLS)} async tools registered")
+    logger.info(f"   ✔   MediTwin Tool Agent built — {len(MEDITWIN_TOOLS)} async tools registered")
     for t in MEDITWIN_TOOLS:
         logger.info(f"   • {t.name}")
 

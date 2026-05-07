@@ -86,7 +86,7 @@ def _not_found(tool_name: str, patient_id: str, table: str) -> dict:
         f"No stored {table.replace('_', ' ')} found for patient '{patient_id}'. "
         "Run a full clinical analysis through the orchestrator first."
     )
-    _emit({"type": "tool_error", "tool": tool_name, "message": f"❌ {msg}"})
+    _emit({"type": "tool_error", "tool": tool_name, "message": f"    ✘   {msg}"})
     return {"error": f"{table}_not_found", "user_message": msg}
 
 
@@ -114,7 +114,7 @@ async def fetch_patient_context(patient_id: str) -> dict:
     _emit({
         "type": "tool_start",
         "tool": "fetch_patient_context",
-        "message": f"📋 Looking up clinical records for patient {patient_id}...",
+        "message": f"    ●   Looking up clinical records for patient {patient_id}...",
     })
 
     result = await db_reader.get_latest_patient_context(patient_id)
@@ -139,7 +139,7 @@ async def fetch_patient_context(patient_id: str) -> dict:
     _emit({
         "type": "tool_complete",
         "tool": "fetch_patient_context",
-        "message": f"✓ {summary}",
+        "message": f"   ✔   {summary}",
         "data": {
             "patient_name":      name,
             "patient_id":        patient_id,
@@ -176,7 +176,7 @@ async def run_diagnosis(patient_id: str) -> dict:
     _emit({
         "type": "tool_start",
         "tool": "run_diagnosis",
-        "message": f"🔬 Looking up stored diagnosis for patient {patient_id}...",
+        "message": f"    ●   Looking up stored diagnosis for patient {patient_id}...",
     })
 
     result = await db_reader.get_latest_diagnosis(patient_id)
@@ -191,18 +191,18 @@ async def run_diagnosis(patient_id: str) -> dict:
 
     flags = []
     if result.get("penicillin_allergy_flagged"):
-        flags.append("⚠️ Penicillin allergy")
+        flags.append("    ⚠   Penicillin allergy")
     if result.get("high_suspicion_sepsis"):
-        flags.append("🚨 Sepsis risk")
+        flags.append("    ☣   Sepsis risk")
     if result.get("requires_isolation"):
-        flags.append("⚠️ Isolation required")
+        flags.append("    ⚠   Isolation required")
 
     flag_str = " | " + " | ".join(flags) if flags else ""
 
     _emit({
         "type": "tool_complete",
         "tool": "run_diagnosis",
-        "message": f"✓ {top_dx} ({top_code}) — {confidence} confidence | {n_diff} differentials{flag_str}",
+        "message": f"   ✔   {top_dx} ({top_code}) — {confidence} confidence | {n_diff} differentials{flag_str}",
         "data": {
             "top_diagnosis":      top_dx,
             "top_icd10_code":     top_code,
@@ -240,7 +240,7 @@ async def analyze_labs(patient_id: str) -> dict:
     _emit({
         "type": "tool_start",
         "tool": "analyze_labs",
-        "message": f"🧪 Looking up stored lab analysis for patient {patient_id}...",
+        "message": f"    ●   Looking up stored lab analysis for patient {patient_id}...",
     })
 
     result = await db_reader.get_latest_lab_analysis(patient_id)
@@ -255,7 +255,7 @@ async def analyze_labs(patient_id: str) -> dict:
     n_alerts = len(result.get("critical_alerts", []))
 
     severity_emoji = {
-        "CRITICAL": "🚨", "HIGH": "⚠️", "MODERATE": "⚡", "LOW": "ℹ️", "NORMAL": "✓"
+        "CRITICAL": "    ☣   ", "HIGH": "    ⚠   ", "MODERATE": "    ▶   ", "LOW": "    ℹ   ", "NORMAL": "   ✔  "
     }.get(severity, "")
 
     msg = f"{severity_emoji} Lab severity: {severity}"
@@ -306,7 +306,7 @@ async def check_drug_safety(patient_id: str) -> dict:
     _emit({
         "type": "tool_start",
         "tool": "check_drug_safety",
-        "message": f"💊 Looking up stored drug safety check for patient {patient_id}...",
+        "message": f"    ●   Looking up stored drug safety check for patient {patient_id}...",
     })
 
     result = await db_reader.get_latest_drug_safety(patient_id)
@@ -319,7 +319,7 @@ async def check_drug_safety(patient_id: str) -> dict:
     approved = result.get("approved_medications", [])
     interactions = len(result.get("critical_interactions", []))
 
-    status_emoji = {"SAFE": "✅", "UNSAFE": "🚫", "CAUTION": "⚠️"}.get(status, "")
+    status_emoji = {"SAFE": "    ✔   ", "UNSAFE": "    ✘   ", "CAUTION": "    ⚠   "}.get(status, "")
 
     msg = f"{status_emoji} Safety status: {status}"
     if approved:
@@ -367,7 +367,7 @@ async def analyze_chest_xray(patient_id: str) -> dict:
     _emit({
         "type": "tool_start",
         "tool": "analyze_chest_xray",
-        "message": f"📷 Looking up stored imaging analysis for patient {patient_id}...",
+        "message": f"    ●   Looking up stored imaging analysis for patient {patient_id}...",
     })
 
     result = await db_reader.get_latest_imaging(patient_id)
@@ -380,7 +380,7 @@ async def analyze_chest_xray(patient_id: str) -> dict:
     triage = result.get("severity_assessment", {}).get("triage_label", "UNKNOWN")
     mock = result.get("mock", False)
 
-    emoji = {"PNEUMONIA": "🫁", "NORMAL": "✓"}.get(prediction, "📊")
+    emoji = {"PNEUMONIA": "    🫁   ", "NORMAL": "    ✔   "}.get(prediction, "  ◈  ")
     mock_note = " [mock data]" if mock else ""
 
     _emit({
@@ -423,7 +423,7 @@ async def simulate_treatment_outcomes(patient_id: str) -> dict:
     _emit({
         "type": "tool_start",
         "tool": "simulate_treatment_outcomes",
-        "message": f"🤖 Looking up stored Digital Twin simulation for patient {patient_id}...",
+        "message": f"    ●   Looking up stored Digital Twin simulation for patient {patient_id}...",
     })
 
     result = await db_reader.get_latest_simulation(patient_id)
@@ -440,13 +440,13 @@ async def simulate_treatment_outcomes(patient_id: str) -> dict:
     rec_confidence = result.get("recommendation_confidence", 0)
 
     risk_emoji = {
-        "CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "⚡", "LOW": "✓"
+        "CRITICAL": "    ☣   ", "HIGH": "    ⚠   ", "MEDIUM": "    ▶   ", "LOW": "    ℹ   ", "NORMAL": "    ✔   "
     }.get(str(risk_profile).upper(), "")
 
     _emit({
         "type": "tool_complete",
         "tool": "simulate_treatment_outcomes",
-        "message": f"✅ Risk: {risk_emoji} {risk_profile} | Recommended: Option {recommended} ({rec_confidence:.0%} confidence)",
+        "message": f"  ✔  Risk: {risk_emoji} {risk_profile} | Recommended: Option {recommended} ({rec_confidence:.0%} confidence)",
         "data": {
             "risk_profile":       risk_profile,
             "recommended_option": recommended,
@@ -491,7 +491,7 @@ async def run_consensus(patient_id: str) -> dict:
     _emit({
         "type": "tool_start",
         "tool": "run_consensus",
-        "message": f"⚖️ Reading all stored results for patient {patient_id} and running consensus...",
+        "message": f"   ●    Reading all stored results for patient {patient_id} and running consensus...",
     })
 
     patient_state, diagnosis, lab_output, imaging_output, drug_safety_output = (
@@ -538,16 +538,16 @@ async def run_consensus(patient_id: str) -> dict:
         human_review = result.get("human_review_required", False)
 
         status_emoji = {
-            "FULL_CONSENSUS":      "✅",
-            "CONFLICT_RESOLVED":   "⚠️",
-            "ESCALATION_REQUIRED": "🚨",
+            "FULL_CONSENSUS":      "   ✔   ",
+            "CONFLICT_RESOLVED":   "   ⚠   ",
+            "ESCALATION_REQUIRED": "   ☣   ",
         }.get(status, "")
 
         msg = f"{status_emoji} Consensus: {status} | Confidence: {confidence:.0%}"
         if conflicts:
             msg += f" | {conflicts} conflict{'s' if conflicts != 1 else ''} detected"
         if human_review:
-            msg += " | ⚠️ HUMAN REVIEW REQUIRED"
+            msg += " |   ⚠   HUMAN REVIEW REQUIRED"
 
         _emit({
             "type": "tool_complete",
@@ -603,7 +603,7 @@ async def generate_clinical_report(patient_id: str, chief_complaint: str) -> dic
     _emit({
         "type": "tool_start",
         "tool": "generate_clinical_report",
-        "message": f"📋 Reading all stored results for patient {patient_id} and generating clinical documentation...",
+        "message": f"   ●    Reading all stored results for patient {patient_id} and generating clinical documentation...",
     })
 
     (
@@ -658,7 +658,7 @@ async def generate_clinical_report(patient_id: str, chief_complaint: str) -> dic
         _emit({
             "type": "tool_complete",
             "tool": "generate_clinical_report",
-            "message": f"✅ SOAP note generated | Patient explanation (grade {grade}) | {n_fhir} FHIR resources | Status: {consensus_status}",
+            "message": f"   ✔   SOAP note generated | Patient explanation (grade {grade}) | {n_fhir} FHIR resources | Status: {consensus_status}",
             "data": {
                 "reading_grade":    grade,
                 "fhir_resources":   n_fhir,

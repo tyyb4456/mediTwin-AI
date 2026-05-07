@@ -51,6 +51,8 @@ from db import save_simulation, SimulationRecord
 
 twin_router = APIRouter()
 
+import logging
+logger = logging.getLogger("stream_twin")
 
 # ── Request model ─────────────────────────────────────────────────────────────
 
@@ -247,7 +249,7 @@ async def _twin_stream(req: TwinStreamRequest) -> AsyncIterator[str]:
                 )
                 guideline_adherence = adherence_results
             except Exception as exc:
-                print(f"  ⚠️  Guideline check failed: {exc}")
+                logger.warning(f"  ⚠  Guideline check failed: {exc}")
 
         # 4d. Allergy + DDI safety check
         safety_check = None
@@ -264,17 +266,17 @@ async def _twin_stream(req: TwinStreamRequest) -> AsyncIterator[str]:
                     },
                 )
             except Exception as exc:
-                print(f"  ⚠️  Safety check failed: {exc}")
+                logger.warning(f"  ⚠   Safety check failed: {exc}")
 
         # 4e. key_risks — mirrors main.py: safety alerts first, then stats
         key_risks: list = []
 
         if safety_check:
             for alert in safety_check.get("allergy_alerts", []):
-                key_risks.append(f"🚨 {alert['alert']}")
+                key_risks.append(f" ☢  {alert['alert']}")
             for interaction in safety_check.get("interaction_alerts", []):
                 key_risks.append(
-                    f"⚠️  DDI: {interaction['warning']} "
+                    f" ⚠  DDI: {interaction['warning']} "
                     f"({interaction['proposed_drug']} ↔ {interaction['existing_drug']})"
                 )
 
@@ -291,7 +293,7 @@ async def _twin_stream(req: TwinStreamRequest) -> AsyncIterator[str]:
             for g in (guideline_adherence if isinstance(guideline_adherence, list) else [guideline_adherence]):
                 if g.get("adherence") == "OFF_GUIDELINE":
                     key_risks.append(
-                        f"⚠️  Off-guideline: {g.get('drug', '')} — {g.get('message', '')}"
+                        f" ⚠   Off-guideline: {g.get('drug', '')} — {g.get('message', '')}"
                     )
 
         if not key_risks:
@@ -332,7 +334,7 @@ async def _twin_stream(req: TwinStreamRequest) -> AsyncIterator[str]:
     ]
     if not safe_scoreable:
         safe_scoreable = scoreable   # All contraindicated — fall back, warn
-        print("  ⚠️  All treatment options CONTRAINDICATED — physician review required")
+        logger.warning("  ⚠   All treatment options CONTRAINDICATED — physician review required")
 
     if avoid_hospitalization:
         non_hosp = [

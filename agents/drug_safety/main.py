@@ -67,6 +67,8 @@ import db
 from db import init as db_init, close as db_close, save_drug_safety, DrugSafetyRecord
 from history_router import router as history_router
 
+import logging
+logger = logging.getLogger("drug_safety.main")
 
 # ── Redis cache ───────────────────────────────────────────────────────────────
 
@@ -84,7 +86,7 @@ async def get_redis() -> Optional[aioredis.Redis]:
             )
             await _redis.ping()
         except Exception as e:
-            print(f"  ⚠️  Redis unavailable ({e}) — caching disabled")
+            logger.warning(f"  ⚠   Redis unavailable ({e}) — caching disabled")
             _redis = None
     return _redis
 
@@ -141,12 +143,11 @@ async def _run_full_safety_check(
     lab_results = (patient_state or {}).get("lab_results", [])
     lab_context: ClinicalLabContext = assess_critical_labs(lab_results)
     if lab_context.critical_flags:
-        print(f"  Lab flags: {[f.display + '=' + str(f.value) + ' (' + f.flag + ')' for f in lab_context.critical_flags]}")
+        logger.warning(f"  Lab flags: {[f.display + '=' + str(f.value) + ' (' + f.flag + ')' for f in lab_context.critical_flags]}")
     if lab_context.sepsis_suspicion:
-        print("  ⚠️  Sepsis suspected — antibiotic urgency elevated")
+        logger.warning("  ⚠   Sepsis suspected — antibiotic urgency elevated")
 
     # ── Phase 1: Deterministic checks ────────────────────────────────────────
-    print("  Phase 1: Deterministic safety checks...")
     contraindications: list[dict] = []
     approved: list[str] = []
     flagged: list[str] = []
@@ -183,7 +184,6 @@ async def _run_full_safety_check(
             approved.append(drug)
 
     # ── Phase 2: External APIs + severity overrides ───────────────────────────
-    print("  Phase 2: FDA interactions + severity overrides...")
     rxcui_map: dict = {}
     rxnav_interactions: list = []
     fda_warnings: dict = {}
@@ -202,7 +202,7 @@ async def _run_full_safety_check(
     else:
         fda_warnings = await get_fda_warnings_batch(proposed_medications)
 
-    print(f"  {len(rxnav_interactions)} interaction(s) found.")
+    logger.info(f"  {len(rxnav_interactions)} interaction(s) found.")
 
     # ── Phase 3: Safety status ────────────────────────────────────────────────
     has_critical_contra = any(c.get("severity") in ("CRITICAL", "HIGH") for c in contraindications)
@@ -253,7 +253,7 @@ async def _run_full_safety_check(
         if not patient_risk_profile.get("safe_to_proceed", True) and \
            patient_risk_profile.get("overall_risk_level") in ("CRITICAL", "HIGH"):
             llm_vetoed = True
-            print(f"  ⚠️  LLM veto: {patient_risk_profile.get('overall_risk_level')} risk, moving {len(approved)} approved to flagged")
+            logger,Warning(f"  ⚠   LLM veto: {patient_risk_profile.get('overall_risk_level')} risk, moving {len(approved)} approved to flagged")
             for drug in approved:
                 entry = {
                     "drug": drug,
@@ -291,7 +291,7 @@ async def _run_full_safety_check(
         for drug, result in zip(flagged, alt_results):
             proactive_alternatives[drug] = result.model_dump() if result else None
             if result:
-                print(f"  Alternatives for {drug}: {[a.drug for a in result.alternatives]}")
+                logger.info(f"  Alternatives for {drug}: {[a.drug for a in result.alternatives]}")
 
     # ── Phase 5c: Merge enrichment ────────────────────────────────────────────
     enriched_rxnav = list(rxnav_interactions)

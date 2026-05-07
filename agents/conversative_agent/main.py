@@ -69,18 +69,18 @@ async def lifespan(app: FastAPI):
     try:
         async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
             _agent = await build_tool_agent(checkpointer)
-            logger.info("✓ MediTwin Tool Agent ready on port 8010")
+            logger.info("    ✔    MediTwin Tool Agent ready on port 8010")
             yield
     except Exception as e:
-        logger.warning(f"PostgreSQL unavailable ({e}) — falling back to MemorySaver")
+        logger.warning(f"    ⚠   PostgreSQL unavailable ({e}) — falling back to MemorySaver")
         try:
             checkpointer = MemorySaver()
             _agent = await build_tool_agent(checkpointer)
-            logger.info("✓ MediTwin Tool Agent ready (MemorySaver) on port 8010")
+            logger.info("    ✔   MediTwin Tool Agent ready (MemorySaver) on port 8010")
         except Exception as e2:
             logger.error(f"Tool Agent failed to start: {e2}")
         yield
-    logger.info("✓ MediTwin Tool Agent shutdown")
+    logger.info("    ✔   MediTwin Tool Agent shutdown")
 
 
 app = FastAPI(
@@ -211,7 +211,7 @@ async def query(request: QueryRequest) -> JSONResponse:
             config=config,
         )
     except Exception as e:
-        logger.error(f"Agent execution failed: {e}", exc_info=True)
+        logger.error(f"    ✘    Agent execution failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Agent failed: {str(e)}")
 
     elapsed = round(time.time() - start_time, 2)
@@ -260,43 +260,6 @@ async def health() -> JSONResponse:
     if note:
         body["note"] = note
     return JSONResponse(content=body)
-
-
-# ── A2A Agent Card ─────────────────────────────────────────────────────────────
-
-@app.get("/.well-known/agent-card")
-async def agent_card() -> JSONResponse:
-    from tools import MEDITWIN_TOOLS
-    return JSONResponse(content={
-        "name":    "MediTwin Tool Agent",
-        "version": "2.0.0",
-        "port":    8010,
-        "type":    "ReAct Tool-Calling Agent",
-        "description": (
-            "A LangGraph ReAct agent where all 8 MediTwin specialist agents are async @tools. "
-            "The LLM triages every query: if a patient ID is present it fetches patient "
-            "context then selectively calls only the relevant specialist tools; "
-            "if no patient ID is present it answers from general medical knowledge."
-        ),
-        "triage_logic": {
-            "with_patient_id":    "fetch_patient_context → selective tools based on query intent",
-            "without_patient_id": "direct LLM answer from medical knowledge, zero tool calls",
-        },
-        "tools": [{"name": t.name, "description": t.description[:120]} for t in MEDITWIN_TOOLS],
-        "capabilities": [
-            "natural_language_query",
-            "automatic_patient_id_detection",
-            "selective_tool_invocation",
-            "general_medical_knowledge",
-            "thread_scoped_memory",
-            "sse_streaming",
-            "server_side_patient_state_caching",
-        ],
-        "endpoints": {
-            "query":        "POST /query — JSON response",
-            "query_stream": "POST /query/stream — SSE streaming",
-        },
-    })
 
 
 if __name__ == "__main__":

@@ -45,10 +45,10 @@ async def init() -> None:
     try:
         _pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
         await _ensure_table()
-        logger.info("✓ PostgreSQL pool ready (drug_safety)")
+        logger.info("  ✔  PostgreSQL pool ready (drug_safety)")
     except Exception as e:
         logger.warning(
-            f"PostgreSQL unavailable ({e}) — drug safety results will NOT be persisted"
+            f"   ⚠  PostgreSQL unavailable ({e}) — drug safety results will NOT be persisted"
         )
         _pool = None
 
@@ -258,7 +258,7 @@ async def save_drug_safety(record: DrugSafetyRecord) -> Optional[int]:
             return None
 
     except Exception as e:
-        logger.error(f"[{record.request_id}] DB save failed (non-fatal): {e}")
+        logger.error(f"[{record.request_id}] ✘  DB save failed (non-fatal): {e}")
         return None
 
 

@@ -17,6 +17,9 @@ from langchain_core.output_parsers import JsonOutputParser
 from dotenv import load_dotenv
 load_dotenv()
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 from conflict_detector import Conflict
 
 COLLECTION_NAME = "medical_knowledge"
@@ -82,17 +85,17 @@ class TiebreakerRAG:
 
             count = self._vectorstore._collection.count()
             if count == 0:
-                print(f"  ⚠️  Tiebreaker: ChromaDB collection empty — run knowledge_base/ingest.py")
+                logging.warning(f"  ⚠ Tiebreaker: ChromaDB collection empty — run knowledge_base/ingest.py")
                 return False
 
             self._llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash", temperature=0.2)
 
             self._ready = True
-            print(f"  ✓ Tiebreaker RAG ready ({count} chunks in collection)")
+            logging.info(f"  ✔  Tiebreaker RAG ready ({count} chunks in collection)")
             return True
 
         except Exception as e:
-            print(f"  ⚠️  Tiebreaker RAG init failed: {e}")
+            logging.error(f"  ✘  Tiebreaker RAG init failed: {e}")
             return False
 
     def _build_patient_summary(self, patient_state: dict) -> str:
@@ -158,7 +161,7 @@ class TiebreakerRAG:
             return result
 
         except Exception as e:
-            print(f"  ⚠️  Tiebreaker RAG failed: {e}")
+            logging.error(f"  ✘  Tiebreaker RAG failed: {e}")
             return None
 
 

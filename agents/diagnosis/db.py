@@ -40,9 +40,9 @@ async def init() -> None:
     try:
         _pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
         await _ensure_table()
-        logger.info("✓ PostgreSQL pool ready")
+        logger.info("     ✔    PostgreSQL pool ready")
     except Exception as e:
-        logger.warning(f"PostgreSQL unavailable ({e}) — diagnosis results will NOT be persisted")
+        logger.warning(f"    ⚠   PostgreSQL unavailable ({e}) — diagnosis results will NOT be persisted")
         _pool = None
 
 
@@ -166,14 +166,14 @@ async def save_diagnosis(record: DiagnosisRecord) -> Optional[int]:
             )
 
         if row:
-            logger.info(f"[{record.request_id}] Diagnosis saved → row id={row['id']} patient={record.patient_id}")
+            logger.info(f"    ✔   [{record.request_id}] Diagnosis saved → row id={row['id']} patient={record.patient_id}")
             return row["id"]
         else:
-            logger.debug(f"[{record.request_id}] Duplicate request_id — skipped insert")
+            logger.debug(f"    ℹ   [{record.request_id}] Duplicate request_id — skipped insert")
             return None
 
     except Exception as e:
-        logger.error(f"[{record.request_id}] DB save failed (non-fatal): {e}")
+        logger.error(f"    ✘   [{record.request_id}] DB save failed (non-fatal): {e}")
         return None
 
 
