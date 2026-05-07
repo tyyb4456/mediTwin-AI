@@ -22,9 +22,9 @@ RUN pip install --no-cache-dir --timeout=300 \
     python-dotenv
 
 COPY shared/ /app/shared/
-COPY agents/tool_agent/ /app/agents/tool_agent/
+COPY agents/conversative_agent/ /app/agents/conversative_agent/
 
-WORKDIR /app/agents/tool_agent
+WORKDIR /app/agents/conversative_agent
 
 EXPOSE 8010
 

@@ -1,7 +1,7 @@
 version: '3.8'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MediTwin AI — Docker Compose (Updated with PostgreSQL Checkpointer)
+# MediTwin AI — Docker Compose (Full Stack: Backend + Frontend)
 #
 # All build contexts are set to "." (project root) so Dockerfiles can
 # reference shared/, requirements.txt, and agent code via absolute paths
@@ -371,6 +371,32 @@ services:
     networks:
       - meditwin-network
     restart: unless-stopped
+
+  # ── Frontend: React/Vite UI served via Nginx (port 3000) ─────────────────
+  #
+  #   Built from the sibling meditwin-ui/ directory using a multi-stage
+  #   Dockerfile (Node build → Nginx serve). Nginx proxies /api/* requests
+  #   to the orchestrator service inside the Docker network.
+  #
+  #   Access the app at: http://localhost:3000
+
+  frontend:
+    build:
+      context: ../meditwin-ui
+      dockerfile: Dockerfile
+    container_name: meditwin-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - orchestrator
+    networks:
+      - meditwin-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:80" ]
+      interval: 60s
+      timeout: 5s
+      retries: 3
 
 networks:
   meditwin-network:
