@@ -14,7 +14,12 @@ RUN pip install --no-cache-dir --timeout=300 \
     "uvicorn[standard]" \
     pydantic \
     pydantic-settings \
+    asyncpg \ 
+    langchain \
+    langchain_core \
+    langchain-google-genai \
     tensorflow-cpu \
+    python-multipart \
     Pillow \
     numpy \
     python-dotenv
