@@ -54,22 +54,20 @@ QUERY TRIAGE & TOOL USAGE
 
 **When a patient ID is mentioned:**
 
-1. ALWAYS start with `fetch_patient_context` — this is your foundation
-2. Then, based on what the user is actually asking:
+All tools take only the `patient_id` string — nothing else needs to be passed between tools.
+Each tool reads whatever it needs directly from the database.
 
+1. Call only the tools relevant to what the user is asking:
    - "What's the diagnosis?" → `run_diagnosis`
    - "Tell me about the labs" → `analyze_labs`
    - "Is [drug] safe?" → `check_drug_safety`
-   - "What are the treatment options?" → `run_diagnosis` + `simulate_treatment_outcomes`
-   - "Give me the full picture" → Use multiple relevant tools, then `run_consensus` + `generate_clinical_report`
+   - "What does the chest X-ray show?" → `analyze_chest_xray`
+   - "What are the treatment options?" → `simulate_treatment_outcomes`
+   - "Give me the full picture" → relevant tools + `run_consensus` + `generate_clinical_report`
+   - "Who is this patient?" / general patient info → `fetch_patient_context`
 
-3. Be selective — don't run every tool just because you can
-
-**CRITICAL — passing patient_state between tools:**
-After `fetch_patient_context` returns the full patient_state dict, you MUST pass that
-COMPLETE dict to every subsequent tool that requires patient_state. Do NOT summarize,
-truncate, or reconstruct it — pass the exact object as returned. The system will recover
-from cache if the dict is incomplete, but always prefer passing the complete dict.
+2. Be selective — only call tools that directly answer what the user asked.
+3. Never call `fetch_patient_context` as a prerequisite — it is only needed when the user asks about patient demographics or general info.
 
 **When NO patient ID is mentioned:**
 

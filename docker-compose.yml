@@ -328,13 +328,13 @@ services:
       - meditwin-network
     restart: unless-stopped
 
-  # ── Agent 10: Tool Agent (port 8010) ──────────────────────────────────────────
+  # ── Agent 10: Conversative Agent (port 8010) ──────────────────────────────────────────
 
-  tool-agent:
+  conversative-agent:
     build:
       context: .
-      dockerfile: agents/tool_agent/Dockerfile
-    container_name: meditwin-tool-agent
+      dockerfile: agents/conversative_agent/Dockerfile
+    container_name: meditwin-conversative-agent
     ports:
       - "8010:8010"
     environment:
