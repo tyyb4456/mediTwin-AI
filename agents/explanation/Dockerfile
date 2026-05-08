@@ -4,13 +4,13 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --timeout=300 \
+RUN pip install --timeout=300 \
     fastapi \
     "uvicorn[standard]" \
     pydantic \
     pydantic-settings \
     asyncpg \
-    sklearn \
+    scikit-learn \
     xgboost-cpu \
     langchain \
     langchain-google-genai \
