@@ -26,6 +26,14 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 import logging
+import sys
+
+# Configure logging to output to stdout (Docker needs this!)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger("ingest")
 
 from dotenv import load_dotenv
@@ -149,35 +157,44 @@ def verify_ingestion(vectorstore):
 
 
 def main():
-    logger.info("=" * 60)
-    logger.info("MediTwin Knowledge Base Ingest Pipeline")
-    logger.info("=" * 60)
+    print("=" * 60)
+    print("MediTwin Knowledge Base Ingest Pipeline")
+    print("=" * 60)
+    
+    # Check for API key
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        print("✘ GOOGLE_API_KEY not set in environment!")
+        print("  Set it in .env or pass via docker-compose")
+        sys.exit(1)
+    
+    print(f"✔ GOOGLE_API_KEY loaded (length: {len(api_key)})")
     
     # Step 1: Load documents
-    logger.info("\n1. Loading documents...")
+    print("\n1. Loading documents...")
     documents = load_documents(SOURCES_DIR)
     if not documents:
         sys.exit(1)
     
     # Step 2: Split into chunks
-    logger.info("\n2. Splitting documents...")
+    print("\n2. Splitting documents...")
     chunks = split_documents(documents)
     
     # Step 3: Connect to ChromaDB
-    logger.info("\n3. Connecting to ChromaDB...")
+    print("\n3. Connecting to ChromaDB...")
     client = get_chroma_client()
     
     # Step 4: Ingest
-    logger.info("\n4. Embedding and ingesting...")
+    print("\n4. Embedding and ingesting...")
     vectorstore = ingest_documents(chunks, client)
     
     # Step 5: Verify
-    logger.info("\n5. Verifying ingestion...")
+    print("\n5. Verifying ingestion...")
     verify_ingestion(vectorstore)
     
-    logger.info("\n" + "=" * 60)
-    logger.info(" ✔  Knowledge base ready! Diagnosis Agent can now start.")
-    logger.info ("=" * 60)
+    print("\n" + "=" * 60)
+    print(" ✔  Knowledge base ready! Diagnosis Agent can now start.")
+    print ("=" * 60)
 
 
 if __name__ == "__main__":

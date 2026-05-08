@@ -35,6 +35,9 @@ from pydantic import BaseModel, Field
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from inference import (
     load_model_from_disk,
     is_model_loaded,          # ← accessor, not bare bool (fixes import-by-value bug)

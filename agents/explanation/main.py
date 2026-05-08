@@ -42,8 +42,9 @@ import db
 
 # ── Digital Twin model path for SHAP-style attribution ────────────────────────
 DIGITAL_TWIN_MODELS_DIR = (
-    Path(__file__).parent.parent / "digital_twin" / "models"
+    Path(__file__).parent.parent / "agents" / "digital_twin" / "models"
 )
+
 READMISSION_MODEL_PATH = DIGITAL_TWIN_MODELS_DIR / "readmission_30d.json"
 FEATURE_NAMES_PATH     = DIGITAL_TWIN_MODELS_DIR / "feature_names.json"
 

@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir --timeout=300 \
     pydantic \
     pydantic-settings \
     asyncpg \
+    sklearn \
     xgboost-cpu \
     langchain \
     langchain-google-genai \

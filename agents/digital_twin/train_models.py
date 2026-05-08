@@ -41,6 +41,9 @@ MODELS_DIR.mkdir(exist_ok=True)
 
 N_SAMPLES = 8_000   # at 8% mortality → ~640 positives in train, plenty to learn
 
+import logging
+logger = logging.getLogger("xgboost")
+
 
 # ── Feature definitions (must match feature_engineering.py exactly) ────────────
 FEATURE_NAMES = [
@@ -261,12 +264,12 @@ def train_and_save_model(
     y_prob = model.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, y_prob)
     prevalence = y_train.mean()
-    print(f"  {name}: AUC={auc:.3f}, prevalence={prevalence:.1%}")
+    logger.info(f"  {name}: AUC={auc:.3f}, prevalence={prevalence:.1%}")
 
     # Save
     out_path = MODELS_DIR / f"{name}.json"
     model.save_model(str(out_path))
-    print(f"  Saved → {out_path}")
+    logger.info(f"  ✔  Saved → {out_path}")
     return model
 
 
@@ -283,7 +286,6 @@ def main():
 
     print("\nTraining 5 XGBoost risk classifiers...")
     print(f"Features: {N_FEATURES} | Train/Test: 80/20 split")
-    print()
 
     # FIX: Explicitly train ALL 5 models (original only trained first 3)
     models_to_train = [
@@ -305,10 +307,10 @@ def main():
     feat_path = MODELS_DIR / "feature_names.json"
     with open(feat_path, "w") as f:
         json.dump(FEATURE_NAMES, f, indent=2)
-    print(f"\n  Feature names saved → {feat_path}")
+    print(f"\n  ✔  Feature names saved → {feat_path}")
 
     print("\n" + "=" * 70)
-    print("✅ All 5 models trained and saved!")
+    print(" ✔  All 5 models trained and saved!")
     print("   - readmission_30d.json")
     print("   - mortality_30d.json")
     print("   - complication.json")
@@ -317,7 +319,7 @@ def main():
     print("=" * 70)
     print("\nModels trained on synthetic data — representative, not production-scale.")
     print("Real deployment would train on population-scale EHR data (MIMIC-IV etc.).")
-    print("=" * 70)
+    print(" ✔  Training complete!")
 
 
 if __name__ == "__main__":
