@@ -313,25 +313,32 @@ async def stream_full_analysis(
 
             img_lines, img_result = await collect_agent_stream(
                 client,
-                f"{IMAGING_TRIAGE_URL}/analyze-xray",  # imaging uses its own REST endpoint
+                f"{IMAGING_TRIAGE_URL}/stream",
                 {
                     "patient_id": patient_state.get("patient_id", "unknown"),
                     "image_data": {
-                        "format": "base64",
+                        "format":       "base64",
                         "content_type": "image/jpeg",
-                        "data": image_data,
+                        "data":         image_data,
                     },
                     "patient_context": {
-                        "age":    patient_state.get("demographics", {}).get("age", 40),
-                        "gender": patient_state.get("demographics", {}).get("gender", "unknown"),
+                        "age":               patient_state.get("demographics", {}).get("age", 40),
+                        "gender":            patient_state.get("demographics", {}).get("gender", "unknown"),
+                        "chief_complaint":   patient_state.get("chief_complaint", ""),
+                        "current_diagnosis": None,
                     },
+                    "patient_state": patient_state,
                 },
                 node_name="imaging_triage",
-                timeout=30.0,
+                timeout=60.0,
             )
             for line in img_lines:
                 yield line
-            state["imaging_output"] = img_result
+
+            if img_result is None:
+                state["error_log"].append("WARNING: Imaging Triage Agent failed")
+            else:
+                state["imaging_output"] = img_result
         else:
             yield evt_status("orchestrator",
                              "No image provided — skipping imaging triage",
