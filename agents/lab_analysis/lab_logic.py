@@ -117,7 +117,7 @@ def build_llm_prompt(
     ) if patterns else "No specific clinical patterns detected"
 
     critical_summary = "\n".join(
-        f"⚠️ CRITICAL: {a['display']} {a['value']} — {a['message'][:100]}"
+        f" ⚠  CRITICAL: {a['display']} {a['value']} — {a['message'][:100]}"
         for a in critical_alerts
     ) if critical_alerts else "No critical alerts"
 
@@ -198,7 +198,7 @@ def run_llm_interpretation(
         chain = prompt | structured_llm
         return chain.invoke(inputs)
     except Exception as e:
-        logger.warning(f"Structured LLM interpretation failed: {e}")
+        logger.error(f"  ✘  Structured LLM interpretation failed: {e}")
         return None
 
 

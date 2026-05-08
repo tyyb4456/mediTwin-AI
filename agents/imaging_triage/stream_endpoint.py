@@ -282,7 +282,7 @@ async def _imaging_stream(req: ImagingStreamRequest) -> AsyncIterator[str]:
     # ══════════════════════════════════════════════════════════════════════════
 
     if not model_loaded:
-        yield evt_status(node, "⚠️ Model not loaded — returning mock output", step=2, total=6)
+        yield evt_status(node, "  ⚠  Model not loaded — returning mock output", step=2, total=6)
 
         mock = mock_inference(patient_context)
 

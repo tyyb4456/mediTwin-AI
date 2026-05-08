@@ -24,12 +24,15 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 
+import logging
+logger = logging.getLogger("imaging_triage.inference")
+
 try:
     import tensorflow as tf
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
-    print("⚠️  TensorFlow not installed — imaging agent will run in mock mode")
+    logger.warning("  ⚠  TensorFlow not installed — imaging agent will run in mock mode")
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -81,23 +84,23 @@ def load_model_from_disk() -> bool:
             f"Model file not found: {MODEL_PATH}. "
             "Place efficientnet_b0.keras in agents/imaging_triage/models/"
         )
-        print(f"⚠️  {_model_error}")
+        logger.warning(f"  ⚠  {_model_error}")
         return False
 
     try:
-        print(f"  Loading EfficientNetB0 model from {MODEL_PATH}...")
+        logger.info(f"  ℹ  Loading EfficientNetB0 model from {MODEL_PATH}...")
         _model = tf.keras.models.load_model(str(MODEL_PATH))
         _model_loaded = True
 
         # Warm up — raw [0,255] dummy input to match inference pipeline
         dummy = np.zeros((1, IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.float32)
         _model.predict(dummy, verbose=0)
-        print(f"  ✓ EfficientNetB0 loaded and warmed up: {MODEL_PATH.name}")
+        logger.info(f"  ✔  EfficientNetB0 loaded and warmed up: {MODEL_PATH.name}")
         return True
 
     except Exception as e:
         _model_error = f"Model load failed: {e}"
-        print(f"  ❌ {_model_error}")
+        logger.error(f"  ✘  {_model_error}")
         return False
 
 

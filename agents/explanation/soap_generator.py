@@ -13,6 +13,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
+import logging
+logger = logging.getLogger("soap_generator")
+
 MEDICAL_DISCLAIMER = (
     "\n\nAI-GENERATED CLINICAL DECISION SUPPORT — NOT A SUBSTITUTE FOR PHYSICIAN JUDGMENT. "
     "All findings, diagnoses, and recommendations require physician review and verification "
@@ -170,7 +173,7 @@ def generate_soap_note(
             return result
 
         except Exception as e:
-            print(f"  ⚠️  SOAP LLM failed: {e} — using template fallback")
+            logger.error(f"  ✘  SOAP LLM failed: {e} — using template fallback")
 
     # Rule-based fallback
     return {

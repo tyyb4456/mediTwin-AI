@@ -691,9 +691,12 @@ def check_condition_contraindications(
     return contraindications
 
 
+import logging
+logger = logging.getLogger("safety_core")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LLM: Interaction enrichment (unchanged prompt, lab context added)
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _INTERACTION_ENRICHMENT_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
@@ -763,7 +766,7 @@ async def enrich_interactions_with_llm(
         return result
 
     except Exception as e:
-        print(f"    Interaction enrichment LLM failed: {e}")
+        logger.error(f" ✘   Interaction enrichment LLM failed: {e}")
         return None
 
 
@@ -870,7 +873,7 @@ async def generate_patient_risk_profile(
         return result
 
     except Exception as e:
-        print(f"    Risk profile LLM failed: {e}")
+        logger.error(f" ✘   Risk profile LLM failed: {e}")
         return None
 
 
@@ -984,7 +987,7 @@ async def generate_proactive_alternatives(
         return result
 
     except Exception as e:
-        print(f"  ⚠️  Proactive alternatives LLM failed for {drug_name}: {e}")
+        logger.error(f"  ✘  Proactive alternatives LLM failed for {drug_name}: {e}")
         return None
 
 
@@ -1048,7 +1051,7 @@ async def get_alternative_suggestions_async(
         return result
 
     except Exception as e:
-        print(f"  ⚠️  LLM alternatives failed: {e}")
+        logger.error(f"  ✘  LLM alternatives failed: {e}")
         return None
 
 
@@ -1113,7 +1116,7 @@ def build_fhir_medication_request(
         if lab_context_note:
             note_parts.append(f"Lab context: {lab_context_note}")
 
-    note_parts.append("⚠️ AI-generated — requires physician verification before dispensing.")
+    note_parts.append(" ⚠  AI-generated — requires physician verification before dispensing.")
 
     return {
         "resourceType": "MedicationRequest",

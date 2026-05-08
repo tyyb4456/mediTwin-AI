@@ -25,6 +25,9 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
+import logging
+logger = logging.getLogger("ingest")
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -44,11 +47,11 @@ def load_documents(sources_dir: Path) -> list[Document]:
     
     txt_files = list(sources_dir.glob("**/*.txt"))
     if not txt_files:
-        print(f"❌ No .txt files found in {sources_dir}")
+        logger.warning(f" ✘  No .txt files found in {sources_dir}")
         return documents
     
     for file_path in txt_files:
-        print(f"  Loading: {file_path.name}")
+        logger.info(f"  Loading: {file_path.name}")
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
         
@@ -61,7 +64,7 @@ def load_documents(sources_dir: Path) -> list[Document]:
         )
         documents.append(doc)
     
-    print(f"✓ Loaded {len(documents)} documents")
+    logger.info(f"  ✔  Loaded {len(documents)} documents")
     return documents
 
 
@@ -74,7 +77,7 @@ def split_documents(documents: list[Document]) -> list[Document]:
     )
     
     chunks = splitter.split_documents(documents)
-    print(f"✓ Split into {len(chunks)} chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
+    logger.info(f"  ✔  Split into {len(chunks)} chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
     return chunks
 
 
@@ -87,11 +90,11 @@ def get_chroma_client():
         )
         # Test connection
         client.heartbeat()
-        print(f"✓ Connected to ChromaDB at {CHROMADB_HOST}:{CHROMADB_PORT}")
+        logger.info(f"  ✔  Connected to ChromaDB at {CHROMADB_HOST}:{CHROMADB_PORT}")
         return client
     except Exception as e:
-        print(f"❌ ChromaDB connection failed: {e}")
-        print(f"   Make sure ChromaDB is running: docker-compose up chromadb")
+        logger.error(f"  ✘   ChromaDB connection failed: {e}")
+        logger.error(f"   Make sure ChromaDB is running: docker-compose up chromadb")
         sys.exit(1)
 
 
@@ -100,12 +103,12 @@ def ingest_documents(chunks: list[Document], client: chromadb.ClientAPI):
     
     embedding = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
     
-    print(f"  Embedding {len(chunks)} chunks with Google Gemini Embeddings...")
+    logger.info(f"  Embedding {len(chunks)} chunks with Google Gemini Embeddings...")
     
     # Delete existing collection to start fresh
     try:
         client.delete_collection(COLLECTION_NAME)
-        print(f"  Deleted existing collection: {COLLECTION_NAME}")
+        logger.info(f"  Deleted existing collection: {COLLECTION_NAME}")
     except Exception:
         pass  # Collection doesn't exist yet
     
@@ -121,15 +124,15 @@ def ingest_documents(chunks: list[Document], client: chromadb.ClientAPI):
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
         vectorstore.add_documents(batch)
-        print(f"  Ingested batch {i//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}")
+        logger.info(f"  Ingested batch {i//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}")
     
-    print(f"✓ Successfully ingested {len(chunks)} chunks into collection '{COLLECTION_NAME}'")
+    logger.info(f"  ✔  Successfully ingested {len(chunks)} chunks into collection '{COLLECTION_NAME}'")
     return vectorstore
 
 
 def verify_ingestion(vectorstore):
     """Quick verification that the knowledge base works"""
-    print("\nVerifying knowledge base...")
+    logger.info("\nVerifying knowledge base...")
     
     test_queries = [
         "What are the symptoms of pneumonia?",
@@ -140,41 +143,41 @@ def verify_ingestion(vectorstore):
     for query in test_queries:
         results = vectorstore.similarity_search(query, k=2)
         if results:
-            print(f"  ✓ Query '{query[:50]}...' → found {len(results)} relevant chunks")
+            logger.info(f"  ✔ Query '{query[:50]}...' → found {len(results)} relevant chunks")
         else:
-            print(f"  ❌ Query '{query}' returned no results")
+            logger.warning(f"  ✘ Query '{query}' returned no results")
 
 
 def main():
-    print("=" * 60)
-    print("MediTwin Knowledge Base Ingest Pipeline")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("MediTwin Knowledge Base Ingest Pipeline")
+    logger.info("=" * 60)
     
     # Step 1: Load documents
-    print("\n1. Loading documents...")
+    logger.info("\n1. Loading documents...")
     documents = load_documents(SOURCES_DIR)
     if not documents:
         sys.exit(1)
     
     # Step 2: Split into chunks
-    print("\n2. Splitting documents...")
+    logger.info("\n2. Splitting documents...")
     chunks = split_documents(documents)
     
     # Step 3: Connect to ChromaDB
-    print("\n3. Connecting to ChromaDB...")
+    logger.info("\n3. Connecting to ChromaDB...")
     client = get_chroma_client()
     
     # Step 4: Ingest
-    print("\n4. Embedding and ingesting...")
+    logger.info("\n4. Embedding and ingesting...")
     vectorstore = ingest_documents(chunks, client)
     
     # Step 5: Verify
-    print("\n5. Verifying ingestion...")
+    logger.info("\n5. Verifying ingestion...")
     verify_ingestion(vectorstore)
     
-    print("\n" + "=" * 60)
-    print("✅ Knowledge base ready! Diagnosis Agent can now start.")
-    print("=" * 60)
+    logger.info("\n" + "=" * 60)
+    logger.info(" ✔  Knowledge base ready! Diagnosis Agent can now start.")
+    logger.info ("=" * 60)
 
 
 if __name__ == "__main__":

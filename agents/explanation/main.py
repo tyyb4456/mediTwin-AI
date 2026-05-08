@@ -74,6 +74,9 @@ class ExplanationResponse(BaseModel):
     human_review_required: bool
 
 
+import logging
+logger = logging.getLogger("explanation")
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -88,20 +91,20 @@ async def lifespan(app: FastAPI):
             if FEATURE_NAMES_PATH.exists():
                 with open(FEATURE_NAMES_PATH) as f:
                     _feature_names = json.load(f)
-            print(f"✓ Explanation Agent: loaded risk model ({len(_feature_names)} features)")
+            logger.info(f"  ✔  Explanation Agent: loaded risk model ({len(_feature_names)} features)")
         except Exception as e:
-            print(f"  ⚠️  Risk model load failed: {e} — attribution disabled")
+            logger.error(f"  ✘  Risk model load failed: {e} — attribution disabled")
     else:
-        print(f"  ⚠️  Risk model not found at {READMISSION_MODEL_PATH} — "
-              f"run digital_twin/train_models.py first")
+        logger.warning(f"  ⚠  Risk model not found at {READMISSION_MODEL_PATH} — "
+                       f"run digital_twin/train_models.py first")
 
     await db.init()      # ← PostgreSQL pool + table creation
-    print("✓ Explanation Agent started")
+    logger.info("  ✔  Explanation Agent started")
 
     yield
 
     await db.close()
-    print("✓ Explanation Agent shutdown")
+    logger.info("  ✔  Explanation Agent shutdown")
 
 
 app = FastAPI(
@@ -213,7 +216,7 @@ def build_risk_attribution(
                 "model_note": "Models trained on synthetic data — architecture demonstration only.",
             }
         except Exception as e:
-            print(f"  ⚠️  Risk attribution failed: {e}")
+            logger.error(f"  ✘  Risk attribution failed: {e}")
 
     return {
         "readmission_risk_explanation": "Risk attribution unavailable — Digital Twin models not loaded.",

@@ -55,6 +55,9 @@ from history_router import router as history_router
 from stream_endpoint import imaging_router
 
 
+import logging
+logger = logging.getLogger("imaging_triage_agent")
+
 # ── LLM Interpretation ────────────────────────────────────────────────────────
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -176,7 +179,7 @@ async def run_llm_interpretation(
         })
         return result
     except Exception as e:
-        print(f"⚠️  LLM interpretation failed: {e}")
+        logger.error(f"  ✘  LLM interpretation failed: {e}")
         return None
 
 
@@ -222,7 +225,7 @@ class ImagingResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load CNN model + init DB at startup."""
-    print("Imaging Triage Agent v2.2 POLISHED starting...")
+    logger.info("Imaging Triage Agent v2.2 POLISHED starting...")
 
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
@@ -232,17 +235,17 @@ async def lifespan(app: FastAPI):
         success = await loop.run_in_executor(pool, load_model_from_disk)
 
     if success:
-        print("✓ EfficientNetB0 model loaded and warmed up")
+        logger.info("  ✔  EfficientNetB0 model loaded and warmed up")
     else:
-        print(f"⚠️  Model not loaded ({get_model_error()}) — mock mode active")
+        logger.warning(f"  ⚠  Model not loaded ({get_model_error()}) — mock mode active")
 
     await db_init()
-    print("✓ Imaging Triage Agent v2.2 POLISHED ready")
+    logger.info("  ✔  Imaging Triage Agent v2.2 POLISHED ready")
 
     yield
 
     await db_close()
-    print("✓ Imaging Triage Agent shutdown")
+    logger.info("  ✔  Imaging Triage Agent shutdown")
 
 
 app = FastAPI(

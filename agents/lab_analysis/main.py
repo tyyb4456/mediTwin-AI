@@ -42,6 +42,9 @@ from stream_endpoint import lab_router as stream_router
 
 from db import init as db_init, close as db_close, save_lab_analysis, LabAnalysisRecord
 
+import logging
+logger = logging.getLogger("lab_analysis_agent")
+
 
 # ── Request / Response Models ──────────────────────────────────────────────────
 
@@ -81,16 +84,16 @@ async def lifespan(app: FastAPI):
             temperature=0.2,
         )
         llm_ready = True
-        print("✓ Lab Analysis Agent started — Enhanced LLM interpretation ready")
+        logger.info("  ✔  Lab Analysis Agent started — Enhanced LLM interpretation ready")
     except Exception as e:
-        print(f"⚠️  LLM init failed: {e} — rules engine only mode")
+        logger.error(f"  ✘  LLM init failed: {e} — rules engine only mode")
 
     await db_init()       # ← DB pool startup
 
     yield
 
     await db_close()      # ← DB pool shutdown
-    print("✓ Lab Analysis Agent shutdown")
+    logger.info("  ✔  Lab Analysis Agent shutdown")
 
 
 app = FastAPI(

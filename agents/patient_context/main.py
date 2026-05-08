@@ -117,24 +117,24 @@ async def lifespan(app: FastAPI):
     global http_client
     
     # Startup
-    logger.info("═" * 60)
-    logger.info("Patient Context Agent — Starting Up")
-    logger.info("═" * 60)
+    logger.info(" " * 30)
+    logger.info("  ✔  Patient Context Agent — Starting Up")
+    logger.info("  ═" * 30)
     
     http_client = httpx.AsyncClient(timeout=30.0)
     await redis_client.connect()
     
-    logger.info("✓ HTTP client initialized (timeout: 30s)")
-    logger.info("✓ Redis connection established")
-    logger.info("✓ Patient Context Agent ready on port 8001")
-    logger.info("═" * 60)
+    logger.info("  ✔  HTTP client initialized (timeout: 30s)")
+    logger.info("  ✔  Redis connection established")
+    logger.info("  ✔  Patient Context Agent ready on port 8001")
+    logger.info("  ═" * 60)
 
     await db_init()
     
     yield
     
     # Shutdown
-    logger.info("Patient Context Agent shutting down...")
+    logger.info("  ✔  Patient Context Agent shutting down...")
     await http_client.aclose()
     await redis_client.disconnect()
     await db_close()
@@ -251,7 +251,7 @@ async def fetch_patient_context(
     
     if cached:
         elapsed_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-        logger.info(f"Cache HIT: patient={patient_id}, fetch_time={elapsed_ms}ms")
+        logger.info(f"  ✔  Cache HIT: patient={patient_id}, fetch_time={elapsed_ms}ms")
         
         return PatientContextResponse(
             patient_state=PatientState(**cached),
@@ -264,7 +264,7 @@ async def fetch_patient_context(
     # ── Parallel FHIR Fetch ────────────────────────────────────────────────────
     # CRITICAL: Parallel fetches reduce latency from ~6s (sequential) to ~1s
     
-    logger.info(f"Cache MISS: patient={patient_id}, fetching from FHIR server...")
+    logger.info(f"  ⚠  Cache MISS: patient={patient_id}, fetching from FHIR server...")
     
     # Build all fetch tasks
     tasks = [

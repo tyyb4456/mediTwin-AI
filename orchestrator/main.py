@@ -80,17 +80,17 @@ async def lifespan(app: FastAPI):
     try:
         async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
             _graph = await build_meditwin_graph_with_checkpointer(checkpointer)
-            logger.info("✓ LangGraph StateGraph compiled with PostgreSQL checkpointer + streaming")
-            logger.info("✓ MediTwin Orchestrator ready on port 5000")
+            logger.info("  ✔  LangGraph StateGraph compiled with PostgreSQL checkpointer + streaming")
+            logger.info("  ✔  MediTwin Orchestrator ready on port 5000")
             yield
     except Exception as e:
-        logger.warning(f"PostgreSQL checkpointer unavailable ({e}) — falling back to MemorySaver")
+        logger.warning(f"  ⚠  PostgreSQL checkpointer unavailable ({e}) — falling back to MemorySaver")
         checkpointer = MemorySaver()
         _graph = await build_meditwin_graph_with_checkpointer(checkpointer)
-        logger.info("✓ LangGraph StateGraph compiled with MemorySaver (no persistence)")
-        logger.info("✓ MediTwin Orchestrator ready on port 5000")
+        logger.info("  ✔  LangGraph StateGraph compiled with MemorySaver (no persistence)")
+        logger.info("  ✔  MediTwin Orchestrator ready on port 5000")
         yield
-    logger.info("✓ MediTwin Orchestrator shutdown")
+    logger.info("  ✔  MediTwin Orchestrator shutdown")
 
 
 app = FastAPI(

@@ -79,7 +79,7 @@ async def _drug_stream(req: DrugStreamRequest) -> AsyncIterator[str]:
 
     lab_summary_msg = lab_context.overall_lab_summary
     if lab_context.sepsis_suspicion:
-        lab_summary_msg += " ⚠️ Sepsis suspected — antibiotic urgency elevated."
+        lab_summary_msg += " ⚠ Sepsis suspected — antibiotic urgency elevated."
     yield evt_progress(node, lab_summary_msg, pct=8)
 
     # ── Phase 1: Deterministic checks ────────────────────────────────────────

@@ -9,6 +9,7 @@ Key design decisions (from spec):
   - "You" and "we" — talk directly to the patient
   - Reassuring but honest
 """
+import logging
 import os
 from typing import Optional
 
@@ -16,6 +17,8 @@ import textstat
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+
+logger = logging.getLogger("patient_writer")
 
 # Grade level targets
 TARGET_GRADE = 6
@@ -199,15 +202,15 @@ def generate_patient_explanation(
             if reading_stats["acceptable"] or attempt == MAX_RETRIES:
                 reading_stats["attempts"] = attempt + 1
                 if attempt > 0:
-                    print(f"  ℹ️  Patient text regenerated (attempt {attempt + 1}) — "
+                    logger.info(f"  ℹ  Patient text regenerated (attempt {attempt + 1}) — "
                           f"grade {reading_stats['grade_level']:.1f}")
                 return result, reading_stats
 
-            print(f"  ⚠️  Reading level too high: {reading_stats['grade_level']:.1f} "
-                  f"(max {MAX_ACCEPTABLE_GRADE}) — retrying with stricter prompt")
+            logger.warning(f"  ⚠  Reading level too high: {reading_stats['grade_level']:.1f} "
+                           f"(max {MAX_ACCEPTABLE_GRADE}) — retrying with stricter prompt")
 
         except Exception as e:
-            print(f"  ⚠️  Patient writer LLM attempt {attempt + 1} failed: {e}")
+            logger.error(f"  ✘  Patient writer LLM attempt {attempt + 1} failed: {e}")
 
     # Final fallback
     fallback, _ = _fallback_patient_explanation(

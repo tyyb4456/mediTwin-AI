@@ -42,9 +42,9 @@ async def init() -> None:
     try:
         _pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
         await _ensure_table()
-        logger.info("✓ PostgreSQL pool ready (patient_context)")
+        logger.info("  ✔  PostgreSQL pool ready (patient_context)")
     except Exception as e:
-        logger.warning(f"PostgreSQL unavailable ({e}) — patient context will NOT be persisted")
+        logger.warning(f"  ⚠  PostgreSQL unavailable ({e}) — patient context will NOT be persisted")
         _pool = None
 
 
