@@ -30,6 +30,7 @@ from pydantic import BaseModel
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from agent import build_tool_agent
 from stream_endpoint import router as stream_router
+from conversations_router import router as conversations_router
 import db_reader
 
 logging.basicConfig(
@@ -59,6 +60,7 @@ async def lifespan(app: FastAPI):
 
     # ── Init DB reader pool (used by all tools to query stored results) ──────────
     await db_reader.init()
+    await db_reader.ensure_conversations_table()
 
     if not os.getenv("GOOGLE_API_KEY"):
         logger.warning(
@@ -109,6 +111,7 @@ app.add_middleware(
 )
 
 app.include_router(stream_router)
+app.include_router(conversations_router)
 
 
 # ── Request model ──────────────────────────────────────────────────────────────

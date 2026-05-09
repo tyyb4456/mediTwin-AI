@@ -330,6 +330,102 @@ async def get_latest_imaging(patient_id: str) -> Optional[dict]:
 
 # ── Digital Twin ───────────────────────────────────────────────────────────────
 
+# ── Conversations ──────────────────────────────────────────────────────────────
+
+_CREATE_CONVERSATIONS = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    messages    JSONB NOT NULL DEFAULT '[]',
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at DESC);
+"""
+
+
+async def ensure_conversations_table() -> None:
+    """Create the conversations table if it doesn't exist."""
+    if not _pool:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(_CREATE_CONVERSATIONS)
+    except Exception as e:
+        logger.error(f"  ✘    [conversations] Table setup failed: {e}")
+
+
+async def list_conversations() -> list[dict]:
+    """Return all conversations ordered by most recently updated."""
+    if not _pool:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, session_id, messages, created_at, updated_at "
+                "FROM conversations ORDER BY updated_at DESC"
+            )
+        return [
+            {
+                "id":         r["id"],
+                "session_id": r["session_id"],
+                "messages":   _load(r["messages"]) or [],
+                "created_at": r["created_at"].isoformat(),
+                "updated_at": r["updated_at"].isoformat(),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"  ✘    [conversations] list failed: {e}")
+        return []
+
+
+async def create_conversation(conv_id: str, session_id: str) -> bool:
+    """Insert a new empty conversation. Returns True on success."""
+    if not _pool:
+        return False
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO conversations (id, session_id, messages) "
+                "VALUES ($1, $2, '[]') ON CONFLICT (id) DO NOTHING",
+                conv_id, session_id,
+            )
+        return True
+    except Exception as e:
+        logger.error(f"  ✘    [conversations] create failed: {e}")
+        return False
+
+
+async def update_conversation_messages(conv_id: str, messages: list) -> bool:
+    """Overwrite the messages array and bump updated_at."""
+    if not _pool:
+        return False
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE conversations SET messages=$1, updated_at=NOW() WHERE id=$2",
+                json.dumps(messages), conv_id,
+            )
+        return True
+    except Exception as e:
+        logger.error(f"  ✘    [conversations] update failed: {e}")
+        return False
+
+
+async def delete_conversation(conv_id: str) -> bool:
+    """Delete a conversation by id."""
+    if not _pool:
+        return False
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("DELETE FROM conversations WHERE id=$1", conv_id)
+        return True
+    except Exception as e:
+        logger.error(f"  ✘    [conversations] delete failed: {e}")
+        return False
+
+
 async def get_latest_simulation(patient_id: str) -> Optional[dict]:
     """
     Return the most recent digital_twin_simulations row for patient_id,
