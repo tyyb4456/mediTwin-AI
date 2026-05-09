@@ -200,13 +200,16 @@ async def _stream_query(
                             yield _sse({"type": "llm_token", "token": part})
 
             # ── Capture final agent output ─────────────────────────────────────
-            # create_agent compiles to a LangGraph graph; the top-level chain
-            # name varies. We capture messages from any chain_end that has them.
+            # Multiple on_chain_end events fire (one per node). We only update
+            # final_messages when the new list is strictly larger — this ensures
+            # we always keep the most complete message set (which includes the
+            # final AI response) and never let a sub-chain's partial list
+            # overwrite it and cause _final_answer() to pick the wrong message.
             elif kind == "on_chain_end":
                 output = data.get("output", {})
                 if isinstance(output, dict):
                     msgs = output.get("messages", [])
-                    if msgs:
+                    if msgs and len(msgs) > len(final_messages):
                         final_messages = msgs
 
     except Exception as exc:

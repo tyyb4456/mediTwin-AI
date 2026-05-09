@@ -30,6 +30,7 @@ from pydantic import BaseModel
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from agent import build_tool_agent
 from stream_endpoint import router as stream_router
+import db_reader
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,12 +57,16 @@ async def lifespan(app: FastAPI):
         or "postgresql://postgres:postgres@localhost:5432/meditwin_checkpoints"
     )
 
+    # ── Init DB reader pool (used by all tools to query stored results) ──────────
+    await db_reader.init()
+
     if not os.getenv("GOOGLE_API_KEY"):
         logger.warning(
             "GOOGLE_API_KEY not set — Tool Agent starting in degraded mode. "
             "Set GOOGLE_API_KEY to enable the conversational agent."
         )
         yield
+        await db_reader.close()
         return
 
     from langgraph.checkpoint.memory import MemorySaver
@@ -80,6 +85,8 @@ async def lifespan(app: FastAPI):
         except Exception as e2:
             logger.error(f"Tool Agent failed to start: {e2}")
         yield
+
+    await db_reader.close()
     logger.info("    ✔   MediTwin Tool Agent shutdown")
 
 
