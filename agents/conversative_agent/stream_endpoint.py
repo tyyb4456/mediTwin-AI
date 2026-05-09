@@ -213,8 +213,27 @@ async def _stream_query(
                         final_messages = msgs
 
     except Exception as exc:
-        logger.error(f"    ✘    Stream error: {exc}", exc_info=True)
-        yield _sse({"type": "error", "message": str(exc), "fatal": True})
+        exc_str = str(exc)
+        is_db_conn = any(kw in exc_str.lower() for kw in (
+            "server closed the connection",
+            "consuming input failed",
+            "connection is closed",
+            "connection was closed",
+            "operational error",
+            "broken pipe",
+            "ssl connection",
+        ))
+        if is_db_conn:
+            logger.error(f"    ✘    DB connection lost during stream: {exc}", exc_info=True)
+            yield _sse({
+                "type":    "error",
+                "message": "The database connection was dropped. Please send your message again — the agent will reconnect automatically.",
+                "fatal":   True,
+                "retry":   True,
+            })
+        else:
+            logger.error(f"    ✘    Stream error: {exc}", exc_info=True)
+            yield _sse({"type": "error", "message": exc_str, "fatal": True})
         return
 
     # ── Rich complete event ────────────────────────────────────────────────────

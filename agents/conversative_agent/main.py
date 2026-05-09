@@ -40,6 +40,8 @@ logging.basicConfig(
 logger = logging.getLogger("meditwin.tool_agent")
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import dict_row
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -73,13 +75,41 @@ async def lifespan(app: FastAPI):
 
     from langgraph.checkpoint.memory import MemorySaver
     logger.info("MediTwin Tool Agent starting...")
+    pool = None
     try:
-        async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
-            _agent = await build_tool_agent(checkpointer)
-            logger.info("    ✔    MediTwin Tool Agent ready on port 8010")
-            yield
+        # ── Build a connection pool with TCP keepalives + auto-reconnect ─────────
+        # This prevents the "server closed the connection unexpectedly" crash that
+        # happens when a single idle AsyncConnection is silently dropped by Postgres.
+        pool = AsyncConnectionPool(
+            db_uri,
+            min_size=1,
+            max_size=5,
+            max_idle=300,           # evict connections idle > 5 min
+            reconnect_timeout=60,   # retry reconnect for up to 60 s
+            open=False,
+            kwargs={
+                "autocommit":        True,
+                "prepare_threshold": 0,
+                "row_factory":       dict_row,
+                # TCP keepalives — keep the connection alive during idle periods
+                "keepalives":          1,
+                "keepalives_idle":     30,   # start probes after 30 s idle
+                "keepalives_interval": 10,   # probe every 10 s
+                "keepalives_count":    5,    # drop after 5 missed probes
+            },
+        )
+        await pool.open(wait=True, timeout=15)
+        checkpointer = AsyncPostgresSaver(pool)
+        _agent = await build_tool_agent(checkpointer)
+        logger.info("    ✔    MediTwin Tool Agent ready on port 8010 (pool + keepalives)")
+        yield
     except Exception as e:
-        logger.warning(f"    ⚠   PostgreSQL unavailable ({e}) — falling back to MemorySaver")
+        logger.warning(f"    ⚠   PostgreSQL pool unavailable ({e}) — falling back to MemorySaver")
+        if pool:
+            try:
+                await pool.close()
+            except Exception:
+                pass
         try:
             checkpointer = MemorySaver()
             _agent = await build_tool_agent(checkpointer)
@@ -87,6 +117,12 @@ async def lifespan(app: FastAPI):
         except Exception as e2:
             logger.error(f"Tool Agent failed to start: {e2}")
         yield
+    else:
+        if pool:
+            try:
+                await pool.close()
+            except Exception:
+                pass
 
     await db_reader.close()
     logger.info("    ✔   MediTwin Tool Agent shutdown")
